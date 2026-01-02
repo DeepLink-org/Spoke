@@ -21,3 +21,28 @@ add_executable(smoke_v3
 )
 
 target_link_libraries(smoke_v3 _spoke)
+
+
+add_executable(smoke_v4_agent
+    smoke_v4_agent.cpp
+)
+
+target_link_libraries(smoke_v4_agent spoke_agent _spoke)
+
+add_executable(smoke_v4
+    smoke_v4.cpp
+)
+
+target_link_libraries(smoke_v4 _spoke)
+
+add_executable(smoke_v5_agent
+    smoke_v5_agent.cpp
+)
+
+target_link_libraries(smoke_v5_agent spoke_agent _spoke)
+
+add_executable(smoke_v5
+    smoke_v5.cpp
+)
+
+target_link_libraries(smoke_v5 _spoke)

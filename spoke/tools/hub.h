@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-#include "spoke/types.h"
+#include "spoke/csrc/types.h"
 
 namespace spoke {
 
