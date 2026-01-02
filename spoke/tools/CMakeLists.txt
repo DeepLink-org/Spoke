@@ -8,5 +8,5 @@ target_link_libraries(spoke_hub PUBLIC spoke)
 
 install(TARGETS spoke_hub
     EXPORT SpokeTargets
-    RUNTIME DESTINATION sdk
+    RUNTIME DESTINATION bin
 )

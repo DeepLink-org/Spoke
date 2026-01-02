@@ -8,5 +8,5 @@ install(TARGETS spoke_daemon spoke_agent
     EXPORT SpokeTargets
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib
-    RUNTIME DESTINATION sdk
+    RUNTIME DESTINATION bin
 )

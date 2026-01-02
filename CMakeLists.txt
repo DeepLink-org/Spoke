@@ -8,9 +8,15 @@ include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 
 # Set build output layout
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/sdk)
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
+
+# RPATH configuration
+# Ensure executables can find libraries in the sibling lib directory
+set(CMAKE_INSTALL_RPATH "$ORIGIN/../lib")
+set(CMAKE_BUILD_WITH_INSTALL_RPATH FALSE)
+set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 
 # Header files installation
 file(GLOB SPOKE_HEADERS 
@@ -26,12 +32,12 @@ add_subdirectory(examples)
 # --- CMake Package Export ---
 
 set(INCLUDE_INSTALL_DIR ${CMAKE_INSTALL_INCLUDEDIR})
-set(BIN_INSTALL_DIR sdk)
+set(BIN_INSTALL_DIR ${CMAKE_INSTALL_BINDIR})
 
 configure_package_config_file(
     "cmake/SpokeConfig.cmake.in"
     "${CMAKE_CURRENT_BINARY_DIR}/SpokeConfig.cmake"
-    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/Spoke
+    INSTALL_DESTINATION share/cmake/Spoke
     PATH_VARS INCLUDE_INSTALL_DIR BIN_INSTALL_DIR
 )
 
@@ -44,12 +50,12 @@ write_basic_package_version_file(
 install(EXPORT SpokeTargets
     FILE SpokeTargets.cmake
     NAMESPACE Spoke::
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/Spoke
+    DESTINATION share/cmake/Spoke
 )
 
 install(FILES
     "${CMAKE_CURRENT_BINARY_DIR}/SpokeConfig.cmake"
     "${CMAKE_CURRENT_BINARY_DIR}/SpokeConfigVersion.cmake"
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/Spoke
+    DESTINATION share/cmake/Spoke
 )
 
