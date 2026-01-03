@@ -1,5 +1,8 @@
 @PACKAGE_INIT@
 
+include(CMakeFindDependencyMacro)
+find_dependency(dlslime REQUIRED)
+
 include("${CMAKE_CURRENT_LIST_DIR}/SpokeTargets.cmake")
 
 set(Spoke_LIBRARIES Spoke::core)

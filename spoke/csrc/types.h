@@ -6,6 +6,8 @@ namespace spoke {
 
 enum class Action : uint32_t {
     kInit            = 0x01,
+    kInitRDMA        = 0x08,
+    kRdmaRealloc     = 0x09,  // [New] Request remote buffer expansion
     kStop            = 0xFF,
     kNetSpawn        = 0x04,
     kHubRegisterNode = 0x30,

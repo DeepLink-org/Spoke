@@ -29,8 +29,6 @@ struct Serializer<ComplexTask> {
     // [New] Zero-Copy Interface
     static size_t size(const ComplexTask& t)
     {
-        // Estimate size or serialize first
-        // Simple inefficient way consistent with existing pack:
         return pack(t).size();
     }
 
@@ -54,23 +52,31 @@ int main()
     std::string hub_ip   = "127.0.0.1";
     int         hub_port = 8888;
 
-    std::cout << "[Smoke v5] Connecting to Hub..." << std::endl;
+    std::cout << "[Smoke v6] Connecting to Hub..." << std::endl;
     spoke::Client client(hub_ip, hub_port, true);
 
-    std::cout << "[Smoke v5] Spawning AdvancedActor..." << std::endl;
-    client.spawnRemote("AdvancedActor", "adv_1");
+    std::cout << "[Smoke v6] Spawning AdvancedActor..." << std::endl;
+    client.spawnRemote("AdvancedActor", "adv_6");
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
+    // Explicitly Init RDMA
+    std::cout << "[Smoke v6] Initializing RDMA..." << std::endl;
+    if (!client.initRDMA("adv_6")) {
+        std::cerr << "[Smoke v6] Failed to initialize RDMA! Aborting." << std::endl;
+        return 1;
+    }
+    std::cout << "[Smoke v6] RDMA Initialized." << std::endl;
+
     ComplexTask task;
-    task.id     = 999;
-    task.name   = "ProjectX";
-    task.values = {1.1, 2.2, 3.3, 4.4};
+    task.id     = 666;
+    task.name   = "ZeroCopyCheck";
+    task.values = {10.0, 20.0, 30.0};
 
-    std::cout << "[Smoke v5] Calling remote with Complex Object (Custom Serializer)..." << std::endl;
+    std::cout << "[Smoke v6] Calling remote with Complex Object via RDMA..." << std::endl;
 
-    auto fut = client.callRemote<ComplexTask, std::string>("adv_1", kProcessTask, task);
+    auto fut = client.callRemote<ComplexTask, std::string>("adv_6", kProcessTask, task);
 
-    std::cout << "[Smoke v5] Result: " << fut.get() << std::endl;
+    std::cout << "[Smoke v6] Result: " << fut.get() << std::endl;
 
     return 0;
 }

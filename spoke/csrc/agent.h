@@ -10,6 +10,7 @@
 #include <signal.h>
 #include <string>
 #include <sys/poll.h>
+#include <sys/prctl.h>
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
@@ -45,19 +46,47 @@ public:
     // ==========================================
     pid_t spawnActor(const std::string& type, const std::string& id)
     {
+        // Enforce serialized forking to avoid multi-thread fork hazards (e.g. malloc state corruption)
+        std::lock_guard<std::mutex> fork_lk(spawn_mtx_);
+
         int p2c[2], c2p[2];
         if (pipe(p2c) != 0 || pipe(c2p) != 0)
             return -1;
         pid_t pid = fork();
         if (pid == 0) {
+            // Child process: Exec into a new image to clear all threads/mutexes
             close(p2c[1]);
             close(c2p[0]);
-            auto actor = ActorFactory::instance().create(type, id, p2c[0], c2p[1]);
-            if (actor)
-                actor->run();
-            else
-                std::cerr << "[Agent] Unknown type: " << type << std::endl;
-            exit(0);
+
+            char    exe_path[1024];
+            ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+            if (len == -1) {
+                perror("readlink");
+                exit(1);
+            }
+            exe_path[len] = '\0';
+
+            std::string rx_str = std::to_string(p2c[0]);
+            std::string tx_str = std::to_string(c2p[1]);
+
+            // Args: <exe> --worker <type> <id> <rx> <tx> NULL
+            std::vector<char*> args;
+            args.push_back(exe_path);
+            args.push_back(strdup("--worker"));
+            args.push_back(strdup(type.c_str()));
+            args.push_back(strdup(id.c_str()));
+            args.push_back(strdup(rx_str.c_str()));
+            args.push_back(strdup(tx_str.c_str()));
+            args.push_back(nullptr);
+
+            // Ensure child dies if parent (Daemon) dies
+            prctl(PR_SET_PDEATHSIG, SIGTERM);
+
+            execv(exe_path, args.data());
+
+            // If execv returns, it failed
+            perror("execv failed");
+            exit(1);
         }
         close(p2c[0]);
         close(c2p[1]);
@@ -72,6 +101,8 @@ public:
     template<typename T>
     pid_t spawnActor(const std::string& id)
     {
+        std::lock_guard<std::mutex> fork_lk(spawn_mtx_);
+
         int p2c[2], c2p[2];
         if (pipe(p2c) != 0 || pipe(c2p) != 0)
             return -1;
@@ -180,6 +211,7 @@ private:
     std::map<std::string, ActorHandle>                             registry_;
     std::map<uint32_t, std::shared_ptr<std::promise<std::string>>> promises_;
     std::mutex                                                     mtx_;
+    std::mutex                                                     spawn_mtx_;  // Serialize forks
     std::atomic<uint32_t>                                          seq_{0};
     std::atomic<bool>                                              running_{true};
     std::thread                                                    monitor_thread_;

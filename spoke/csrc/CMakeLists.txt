@@ -12,6 +12,12 @@ target_include_directories(spoke PUBLIC
     $<INSTALL_INTERFACE:include>
 )
 
+# [Changed] DLSlime is now required for Aggressive RDMA
+find_package(dlslime REQUIRED)
+message(STATUS "Spoke: Found DLSlime, enabling RDMA support")
+target_link_libraries(spoke PUBLIC dlslime::dlslime)
+target_compile_definitions(spoke PUBLIC SPOKE_HAS_RDMA)
+
 install(TARGETS spoke
     EXPORT SpokeTargets
     LIBRARY DESTINATION lib

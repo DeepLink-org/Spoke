@@ -3,10 +3,12 @@
 #include <cstring>
 #include <iostream>
 #include <netinet/in.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <thread>
 #include <unistd.h>
 #include <vector>
+
 
 #include "spoke/csrc/agent.h"
 #include "spoke/csrc/types.h"
@@ -58,6 +60,12 @@ void handle_client(int client_fd, Agent* agent)
         if (meta.action == Action::kNetSpawn) {
             std::cout << "[Daemon] Spawning: " << meta.actor_type << std::endl;
             agent->spawnActor(meta.actor_type, meta.actor_id);
+
+            // Send Ack
+            NetHeader   rh{0x504F4B45, sizeof(NetRespMeta), 0};
+            NetRespMeta rm{meta.seq_id, 1};  // Success
+            send(client_fd, &rh, sizeof(rh), 0);
+            send(client_fd, &rm, sizeof(rm), 0);
         }
         else {
             auto        future = agent->callRemoteRaw(meta.actor_id, meta.action, body);
@@ -105,10 +113,26 @@ int run_daemon(int argc, char** argv)
     if (!hub_ip.empty())
         register_to_hub(hub_ip, hub_port, my_port);
 
-    while (true) {
-        int cfd = accept(server_fd, nullptr, nullptr);
-        if (cfd >= 0)
-            std::thread(handle_client, cfd, &local_agent).detach();
+    // Setup signal handling for graceful shutdown
+    static bool g_running = true;
+    signal(SIGINT, [](int) {
+        std::cout << "\n[Daemon] Shutting down..." << std::endl;
+        g_running = false;
+    });
+
+    while (g_running) {
+        // Use select/poll with timeout to allow checking g_running
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(server_fd, &fds);
+        struct timeval tv{1, 0};  // 1s timeout
+
+        int ret = select(server_fd + 1, &fds, nullptr, nullptr, &tv);
+        if (ret > 0 && FD_ISSET(server_fd, &fds)) {
+            int cfd = accept(server_fd, nullptr, nullptr);
+            if (cfd >= 0)
+                std::thread(handle_client, cfd, &local_agent).detach();
+        }
     }
     return 0;
 }
