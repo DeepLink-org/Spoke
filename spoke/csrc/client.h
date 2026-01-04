@@ -35,47 +35,36 @@ public:
 
     ~Client()
     {
-        std::cerr << "[Client] Destructor start. Thread ID: " << std::this_thread::get_id() << std::endl;
         running_ = false;
         if (sock_ != -1) {
-            std::cerr << "[Client] Closing socket" << std::endl;
             shutdown(sock_, SHUT_RDWR);
             close(sock_);
         }
         if (rdma_ep_) {
-            std::cerr << "[Client] Shutting down RDMA" << std::endl;
             rdma_ready_ = false;  // Signal recv loop to exit
             rdma_ep_->shutdown();
         }
 
         try {
             if (receiver_thread_.joinable()) {
-                std::cerr << "[Client] Joining receiver thread (ID: " << receiver_thread_.get_id() << ")" << std::endl;
                 if (receiver_thread_.get_id() == std::this_thread::get_id()) {
-                    std::cerr << "[Client] ERROR: Joining SELF (Receiver Thread)!" << std::endl;
                     receiver_thread_.detach();
                 }
                 else {
                     receiver_thread_.join();
-                    std::cerr << "[Client] Joined receiver thread" << std::endl;
                 }
             }
             if (rdma_receiver_thread_.joinable()) {
-                std::cerr << "[Client] Joining RDMA thread (ID: " << rdma_receiver_thread_.get_id() << ")" << std::endl;
                 if (rdma_receiver_thread_.get_id() == std::this_thread::get_id()) {
-                    std::cerr << "[Client] ERROR: Joining SELF (RDMA Receiver Thread)!" << std::endl;
                     rdma_receiver_thread_.detach();
                 }
                 else {
                     rdma_receiver_thread_.join();
-                    std::cerr << "[Client] Joined RDMA thread" << std::endl;
                 }
             }
         }
-        catch (const std::exception& e) {
-            std::cerr << "[Client] Exception during join: " << e.what() << std::endl;
+        catch (...) {
         }
-        std::cerr << "[Client] Destructor done" << std::endl;
     }
 
     void spawnRemote(const std::string& type, const std::string& id)
