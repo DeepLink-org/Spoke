@@ -125,9 +125,14 @@ private:
         if (hdr.action == Action::kInitRDMA) {
             std::string res = setupRDMA(body);
             PipeHeader  resp_hdr{Action::kInit, hdr.seq_id, (uint32_t)res.size()};
-            write(tx_fd_, &resp_hdr, sizeof(PipeHeader));
-            if (!res.empty())
-                write(tx_fd_, res.data(), res.size());
+            if (write(tx_fd_, &resp_hdr, sizeof(PipeHeader)) < 0) {
+                std::cerr << "[Actor] Failed to write response header" << std::endl;
+            }
+            if (!res.empty()) {
+                if (write(tx_fd_, res.data(), res.size()) < 0) {
+                    std::cerr << "[Actor] Failed to write response body" << std::endl;
+                }
+            }
             return;
         }
 
@@ -135,9 +140,14 @@ private:
         std::string res = processRequest(hdr, MessageView(body));
 
         PipeHeader resp_hdr{Action::kInit, hdr.seq_id, (uint32_t)res.size()};
-        write(tx_fd_, &resp_hdr, sizeof(PipeHeader));
-        if (!res.empty())
-            write(tx_fd_, res.data(), res.size());
+        if (write(tx_fd_, &resp_hdr, sizeof(PipeHeader)) < 0) {
+            std::cerr << "[Actor] Failed to write response header" << std::endl;
+        }
+        if (!res.empty()) {
+            if (write(tx_fd_, res.data(), res.size()) < 0) {
+                std::cerr << "[Actor] Failed to write response body" << std::endl;
+            }
+        }
     }
 
     std::string setupRDMA(const std::string& remote_info_str)
