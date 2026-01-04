@@ -5,7 +5,7 @@ set_target_properties(spoke_daemon PROPERTIES EXPORT_NAME daemon)
 add_library(Spoke::daemon ALIAS spoke_daemon)
 
 target_include_directories(spoke_daemon PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/..>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../..>
 )
 
 install(TARGETS spoke_daemon
