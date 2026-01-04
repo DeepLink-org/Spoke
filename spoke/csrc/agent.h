@@ -3,6 +3,7 @@
 #include "serializer.h"
 #include "types.h"
 #include <atomic>
+#include <cstdio>  // For fprintf
 #include <future>
 #include <iostream>
 #include <map>
@@ -46,14 +47,30 @@ public:
     // ==========================================
     pid_t spawnActor(const std::string& type, const std::string& id)
     {
-        // Enforce serialized forking to avoid multi-thread fork hazards (e.g. malloc state corruption)
+        // Enforce serialized forking to avoid multi-thread fork hazards
         std::lock_guard<std::mutex> fork_lk(spawn_mtx_);
+
+        // Fix: Cleanup existing actor if ID collision
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            if (registry_.find(id) != registry_.end()) {
+                auto& h = registry_[id];
+                close(h.tx_fd);
+                close(h.rx_fd);
+                kill(h.pid, SIGTERM);
+                waitpid(h.pid, nullptr, 0);
+                registry_.erase(id);
+                std::cout << "[Agent] Cleaned up existing actor: " << id << std::endl;
+            }
+        }
 
         int p2c[2], c2p[2];
         if (pipe(p2c) != 0 || pipe(c2p) != 0)
             return -1;
+        std::cout << "[Agent] Forking for actor: " << id << "..." << std::endl;
         pid_t pid = fork();
         if (pid == 0) {
+            // ... child ...
             // Child process: Exec into a new image to clear all threads/mutexes
             close(p2c[1]);
             close(c2p[0]);
@@ -88,10 +105,18 @@ public:
             perror("execv failed");
             exit(1);
         }
-        close(p2c[0]);
-        close(c2p[1]);
+        std::cout << "[Agent] Forked PID: " << pid << ". Updating registry..." << std::endl;
+        close(p2c[0]);  // Close Parent Read from Child (Wait, p2c is Parent->Child)
+        // p2c: 0=Read, 1=Write. Parent writes to 1. Child reads from 0.
+        // Parent MUST CLOSE 0.
+        close(c2p[1]);  // c2p: 0=Read, 1=Write. Child writes to 1. Parent reads from 0.
+        // Parent MUST CLOSE 1.
+
+        std::cout << "[Agent] Parent Pipes: TX=" << p2c[1] << " (p2c[1]), RX=" << c2p[0] << " (c2p[0])" << std::endl;
+
         std::lock_guard<std::mutex> lk(mtx_);
         registry_[id] = {pid, p2c[1], c2p[0]};
+        std::cout << "[Agent] Actor spawned successfully: " << id << " with RX_FD=" << c2p[0] << std::endl;
         return pid;
     }
 
@@ -140,9 +165,21 @@ public:
 
         PipeHeader ph{act, s, (uint32_t)data.size()};
         int        fd = registry_[id].tx_fd;
-        write(fd, &ph, sizeof(ph));
-        if (!data.empty())
-            write(fd, data.data(), data.size());
+
+        if (write(fd, &ph, sizeof(ph)) < 0) {
+            std::cerr << "[Agent] Failed to write header to actor " << id << std::endl;
+            promises_.erase(s);
+            promise->set_value("");
+            return future;
+        }
+        if (!data.empty()) {
+            if (write(fd, data.data(), data.size()) < 0) {
+                std::cerr << "[Agent] Failed to write body to actor " << id << std::endl;
+                promises_.erase(s);
+                promise->set_value("");
+                return future;
+            }
+        }
 
         return future;
     }
@@ -179,29 +216,80 @@ private:
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 continue;
             }
-            if (poll(pfds.data(), pfds.size(), 50) <= 0)
+
+            // Debug Heartbeat
+            static auto last_log = std::chrono::steady_clock::now();
+            auto        now      = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::seconds>(now - last_log).count() >= 3) {
+                fprintf(stderr, "[Agent] Monitor Polling %lu FDs. First FD: %d\n", pfds.size(), pfds[0].fd);
+                last_log = now;
+            }
+
+            int ret = poll(pfds.data(), pfds.size(), 50);
+            if (ret <= 0)
                 continue;
 
+            // fprintf(stderr, "[Agent] Poll returned %d events.\n", ret);
+
             for (auto& p : pfds) {
-                if (p.revents & POLLIN) {
+                if (p.revents & (POLLIN | POLLHUP | POLLERR)) {
                     PipeHeader ph;
-                    if (read(p.fd, &ph, sizeof(ph)) > 0) {
+                    int        n = read(p.fd, &ph, sizeof(ph));
+                    fprintf(stderr, "[Agent] read(FD=%d) returned %d bytes. Expected %lu.\n", p.fd, n, sizeof(ph));
+
+                    if (n == sizeof(ph)) {
                         std::string body;
-                        body.resize(ph.data_size);
                         if (ph.data_size > 0) {
+                            body.resize(ph.data_size);
                             size_t tot = 0;
                             while (tot < ph.data_size) {
                                 int r = read(p.fd, body.data() + tot, ph.data_size - tot);
-                                if (r <= 0)
+                                if (r <= 0) {
+                                    fprintf(stderr, "[Agent] Error/EOF reading body from FD %d. r=%d\n", p.fd, r);
                                     break;
+                                }
                                 tot += r;
                             }
+                            if (tot < ph.data_size) {
+                                fprintf(
+                                    stderr, "[Agent] Incomplete body read. Got %zu, expected %u\n", tot, ph.data_size);
+                                continue;
+                            }
                         }
+
                         std::lock_guard<std::mutex> lk(mtx_);
                         if (promises_.count(ph.seq_id)) {
+                            // fprintf(stderr, "[Agent] Fulfilling promise for Seq: %u\n", ph.seq_id);
                             promises_[ph.seq_id]->set_value(body);
                             promises_.erase(ph.seq_id);
                         }
+                        else {
+                            fprintf(stderr, "[Agent] Promise NOT FOUND for Seq: %u (Orphaned?)\n", ph.seq_id);
+                        }
+                    }
+                    else if (n > 0) {
+                        fprintf(stderr, "[Agent] Partial header read! Got %d bytes. Dropping.\n", n);
+                    }
+                    else if (n == 0) {
+                        // EOF
+                        fprintf(stderr, "[Agent] Actor disconnected (EOF) on FD %d\n", p.fd);
+                        std::lock_guard<std::mutex> lk(mtx_);
+                        std::string                 dead_id;
+                        for (auto& [id, h] : registry_) {
+                            if (h.rx_fd == p.fd) {
+                                dead_id = id;
+                                break;
+                            }
+                        }
+                        if (!dead_id.empty()) {
+                            fprintf(stderr, "[Agent] Detected death of actor: %s\n", dead_id.c_str());
+                            registry_.erase(dead_id);
+                            close(p.fd);
+                        }
+                    }
+                    else {
+                        // Error
+                        perror("[Agent] read error");
                     }
                 }
             }

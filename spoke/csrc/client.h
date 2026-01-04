@@ -35,20 +35,47 @@ public:
 
     ~Client()
     {
+        std::cerr << "[Client] Destructor start. Thread ID: " << std::this_thread::get_id() << std::endl;
         running_ = false;
         if (sock_ != -1) {
+            std::cerr << "[Client] Closing socket" << std::endl;
             shutdown(sock_, SHUT_RDWR);
             close(sock_);
         }
         if (rdma_ep_) {
+            std::cerr << "[Client] Shutting down RDMA" << std::endl;
             rdma_ready_ = false;  // Signal recv loop to exit
             rdma_ep_->shutdown();
         }
 
-        if (receiver_thread_.joinable())
-            receiver_thread_.join();
-        if (rdma_receiver_thread_.joinable())
-            rdma_receiver_thread_.join();
+        try {
+            if (receiver_thread_.joinable()) {
+                std::cerr << "[Client] Joining receiver thread (ID: " << receiver_thread_.get_id() << ")" << std::endl;
+                if (receiver_thread_.get_id() == std::this_thread::get_id()) {
+                    std::cerr << "[Client] ERROR: Joining SELF (Receiver Thread)!" << std::endl;
+                    receiver_thread_.detach();
+                }
+                else {
+                    receiver_thread_.join();
+                    std::cerr << "[Client] Joined receiver thread" << std::endl;
+                }
+            }
+            if (rdma_receiver_thread_.joinable()) {
+                std::cerr << "[Client] Joining RDMA thread (ID: " << rdma_receiver_thread_.get_id() << ")" << std::endl;
+                if (rdma_receiver_thread_.get_id() == std::this_thread::get_id()) {
+                    std::cerr << "[Client] ERROR: Joining SELF (RDMA Receiver Thread)!" << std::endl;
+                    rdma_receiver_thread_.detach();
+                }
+                else {
+                    rdma_receiver_thread_.join();
+                    std::cerr << "[Client] Joined RDMA thread" << std::endl;
+                }
+            }
+        }
+        catch (const std::exception& e) {
+            std::cerr << "[Client] Exception during join: " << e.what() << std::endl;
+        }
+        std::cerr << "[Client] Destructor done" << std::endl;
     }
 
     void spawnRemote(const std::string& type, const std::string& id)
@@ -340,9 +367,16 @@ private:
             if (hdr.data_size > 0)
                 recv(sock_, body.data(), hdr.data_size, MSG_WAITALL);
 
-            if (response_handlers_.count(meta.seq_id)) {
-                response_handlers_[meta.seq_id](body);
-                response_handlers_.erase(meta.seq_id);
+            {
+                std::lock_guard<std::mutex> lk(map_mtx_);
+                if (response_handlers_.count(meta.seq_id)) {
+                    // std::cout << "[Client] Handling response for Seq: " << meta.seq_id << std::endl;
+                    response_handlers_[meta.seq_id](body);
+                    response_handlers_.erase(meta.seq_id);
+                }
+                else {
+                    std::cerr << "[Client] Warning: No handler for Seq: " << meta.seq_id << std::endl;
+                }
             }
         }
     }

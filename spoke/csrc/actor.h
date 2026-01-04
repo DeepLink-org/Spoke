@@ -138,6 +138,7 @@ private:
 
         // Use unified processing
         std::string res = processRequest(hdr, MessageView(body));
+        std::cout << "[Actor] Processed request. Result size: " << res.size() << ". Writing response..." << std::endl;
 
         PipeHeader resp_hdr{Action::kInit, hdr.seq_id, (uint32_t)res.size()};
         if (write(tx_fd_, &resp_hdr, sizeof(PipeHeader)) < 0) {
@@ -148,6 +149,7 @@ private:
                 std::cerr << "[Actor] Failed to write response body" << std::endl;
             }
         }
+        std::cout << "[Actor] Response written to FD " << tx_fd_ << std::endl;
     }
 
     std::string setupRDMA(const std::string& remote_info_str)

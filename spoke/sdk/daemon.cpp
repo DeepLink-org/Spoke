@@ -9,7 +9,6 @@
 #include <unistd.h>
 #include <vector>
 
-
 #include "spoke/csrc/agent.h"
 #include "spoke/csrc/types.h"
 
@@ -60,6 +59,7 @@ void handle_client(int client_fd, Agent* agent)
         if (meta.action == Action::kNetSpawn) {
             std::cout << "[Daemon] Spawning: " << meta.actor_type << std::endl;
             agent->spawnActor(meta.actor_type, meta.actor_id);
+            std::cout << "[Daemon] Spawned actor: " << meta.actor_id << std::endl;
 
             // Send Ack
             NetHeader   rh{0x504F4B45, sizeof(NetRespMeta), 0};
@@ -70,13 +70,19 @@ void handle_client(int client_fd, Agent* agent)
         else {
             auto        future = agent->callRemoteRaw(meta.actor_id, meta.action, body);
             std::string res    = future.get();
+            std::cout << "[Daemon] Received result from actor. Size: " << res.size() << ". Sending to client..."
+                      << std::endl;
 
             NetHeader   rh{0x504F4B45, sizeof(NetRespMeta), (uint32_t)res.size()};
             NetRespMeta rm{meta.seq_id, 1};
-            send(client_fd, &rh, sizeof(rh), 0);
-            send(client_fd, &rm, sizeof(rm), 0);
+            if (send(client_fd, &rh, sizeof(rh), 0) < 0)
+                perror("[Daemon] Failed to send header");
+            if (send(client_fd, &rm, sizeof(rm), 0) < 0)
+                perror("[Daemon] Failed to send meta");
             if (!res.empty())
-                send(client_fd, res.data(), res.size(), 0);
+                if (send(client_fd, res.data(), res.size(), 0) < 0)
+                    perror("[Daemon] Failed to send body");
+            std::cout << "[Daemon] Response sent to client." << std::endl;
         }
     }
     close(client_fd);
@@ -115,6 +121,7 @@ int run_daemon(int argc, char** argv)
 
     // Setup signal handling for graceful shutdown
     static bool g_running = true;
+    signal(SIGPIPE, SIG_IGN);  // Prevent crash on write to dead child/client
     signal(SIGINT, [](int) {
         std::cout << "\n[Daemon] Shutting down..." << std::endl;
         g_running = false;
