@@ -12,6 +12,8 @@ enum class Action : uint32_t {
     kNetSpawn        = 0x04,
     kHubRegisterNode = 0x30,
     kHubFindNode     = 0x31,
+    kNetAllocate     = 0x32,  // [New] V2 Allocation
+    kNetLaunch       = 0x33,  // [New] V2 Launch
     kUserActionStart = 0x10
 };
 
@@ -41,6 +43,63 @@ struct PipeHeader {
     Action   action;
     uint32_t seq_id;
     uint32_t data_size;
+};
+
+// ==========================================
+// [v2 Upgrade] Resource Management
+// ==========================================
+struct ResourceSpec {
+    int32_t num_gpus = 0;
+    int32_t num_cpus = 0; // Reserved
+};
+
+struct RegisterNodeReq {
+    char         ip[64];
+    int32_t      port;
+    ResourceSpec capacity;
+};
+
+struct FindNodeReq {
+    ResourceSpec requirements;
+};
+
+// [New] Gang Allocation Request
+struct AllocateReq {
+    uint32_t num_nodes;        // Number of nodes required
+    uint32_t actors_per_node;  // Actors per node (Total actors = num_nodes * actors_per_node)
+    ResourceSpec res_per_actor;// Resource requirement per actor
+    bool strict_pack = true;   // Require exact packing (true for typical TP/PP)
+};
+
+// Detail for a single allocated slot
+struct AllocatedSlot {
+    char    node_ip[64];
+    int32_t node_port;
+    int32_t global_rank; // Global rank in the gang (0..N-1)
+    int32_t local_rank;  // Local rank in the node (0..M-1)
+    int32_t gpu_id;      // Physical GPU ID assigned
+};
+
+// Response from Hub
+struct AllocateResp {
+    char     ticket_id[64]; // Allocation UUID
+    uint32_t num_members;   // Total slots
+    // Followed by num_members * AllocatedSlot (Variable length body)
+};
+
+// [New] Launch Request (Client -> Hub)
+struct LaunchReq {
+    char ticket_id[64];
+    uint32_t global_rank;
+    // Followed by args (std::vector<string> serialized)
+};
+
+// [New] Spawn Request Body (Hub -> Agent)
+// Replaces the empty body of kNetSpawn for V2 calls
+struct SpawnActorReq {
+    ResourceSpec resources;
+    int32_t assigned_gpu_ids[8]; // Fixed size for simplicity, supports up to 8 GPUs
+    // Followed by args...
 };
 
 }  // namespace spoke

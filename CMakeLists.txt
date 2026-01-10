@@ -13,13 +13,20 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
 # RPATH configuration
-# Ensure executables can find libraries in the sibling lib directory
 set(CMAKE_INSTALL_RPATH "$ORIGIN/../lib")
 set(CMAKE_BUILD_WITH_INSTALL_RPATH FALSE)
 set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 
+# --- Vendor DLSlime ---
+set(BUILD_RDMA ON CACHE BOOL "Enable RDMA" FORCE)
+set(BUILD_PYTHON OFF CACHE BOOL "Disable Python bindings" FORCE)
+set(BUILD_TEST OFF CACHE BOOL "Disable Tests" FORCE)
+set(BUILD_BENCH OFF CACHE BOOL "Disable Benchmarks" FORCE)
+# Use object library mode or static to avoid rpath hell? No, shared is fine if handled right.
+add_subdirectory(third_party/DLSlime)
+
 # Header files installation
-file(GLOB SPOKE_HEADERS 
+file(GLOB SPOKE_HEADERS
     "spoke/csrc/*.h"
 )
 install(FILES ${SPOKE_HEADERS} DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/spoke)
@@ -30,7 +37,6 @@ add_subdirectory(spoke/tools)
 add_subdirectory(examples)
 
 # --- CMake Package Export ---
-
 set(INCLUDE_INSTALL_DIR ${CMAKE_INSTALL_INCLUDEDIR})
 set(BIN_INSTALL_DIR ${CMAKE_INSTALL_BINDIR})
 
@@ -58,4 +64,3 @@ install(FILES
     "${CMAKE_CURRENT_BINARY_DIR}/SpokeConfigVersion.cmake"
     DESTINATION share/cmake/Spoke
 )
-

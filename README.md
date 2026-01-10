@@ -4,6 +4,10 @@ Spoke is a lightweight, low-latency distributed task execution framework designe
 
 ## 🚀 Key Features
 
+- **Resource-Aware Gang Scheduling (New in V2)**:
+  - **`gangAllocate` API**: Atomically allocate multiple actors (e.g., 8 GPUs on one node) to ensure locality.
+  - **Two-Phase Launch**: Decouples resource reservation from process launch, allowing precise topology configuration.
+  - **GPU Isolation**: Automatic `CUDA_VISIBLE_DEVICES` injection.
 - **Actor-Based Model**: Intuitive unit of distributed execution. Define a class, register it as an Actor, and invoke its methods remotely.
 - **Zero-Copy RDMA Serialization**: Deep integration with **DLSlime** enables a "True Zero-Copy" (Zero-ish) path, removing unnecessary heap allocations and memory copies during RDMA transfers.
 - **Robust Process Management**:
@@ -13,11 +17,16 @@ Spoke is a lightweight, low-latency distributed task execution framework designe
 - **Bi-Directional Communication**: Efficient request-response cycles with RDMA-backed response paths.
 - **Scalable Control Plane**: Lightweight TCP-based control plane with a high-performance binary protocol.
 
+## 📚 Documentation
+
+- [**V2 User Guide (Gang Scheduling)**](../../docs/spoke_v2_user_guide.md): Detailed guide on using the new allocation and launch APIs.
+
 ## 🛠️ Core Components
 
 - **`spoke::Client`**: The primary user interface for spawning actors and making remote calls (`callRemote`).
 - **`spoke::Actor`**: The base class for remote services. Use the `SPOKE_METHOD` macro to define remote procedures.
 - **`spoke::Agent`**: The background process (Daemon) that manages actor lifecycles and provides the runtime environment.
+- **`spoke::Hub`**: Central registry and scheduler for resource management.
 - **`spoke::Serializer`**: A extensible serialization interface supporting zero-copy `PackTo` and `UnpackFrom` operations.
 
 ## 📦 Installation
@@ -40,7 +49,26 @@ target_link_libraries(my_app PUBLIC Spoke::core Spoke::agent)
 
 ## 💻 Usage Example
 
-### 1. Define an Actor
+### 1. Gang Allocation (V2)
+
+```cpp
+#include "spoke/csrc/client.h"
+
+int main() {
+    spoke::Client client("127.0.0.1", 8888, true);
+
+    // Allocate 1 Node with 8 GPUs
+    spoke::ResourceSpec res; res.num_gpus = 1;
+    auto alloc = client.gangAllocate(1, 8, res).get();
+
+    // Launch Actors
+    for(int i=0; i<alloc.num_members; ++i) {
+        client.launchActor(alloc.ticket_id, i, "MyActor", "worker_" + std::to_string(i), "");
+    }
+}
+```
+
+### 2. Define an Actor
 
 ```cpp
 #include "spoke/csrc/actor.h"
@@ -60,7 +88,7 @@ public:
 SPOKE_REGISTER_ACTOR(MyActor, "MyActor");
 ```
 
-### 2. Invoke Remotely (RDMA Zero-Copy)
+### 3. Invoke Remotely (RDMA Zero-Copy)
 
 ```cpp
 #include "spoke/csrc/client.h"

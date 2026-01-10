@@ -14,7 +14,7 @@
 
 namespace spoke {
 
-void register_to_hub(const std::string& hub_ip, int hub_port, int my_port)
+void register_to_hub(const std::string& hub_ip, int hub_port, int my_port, const ResourceSpec& capacity)
 {
     int                sock = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in sa;
@@ -23,22 +23,30 @@ void register_to_hub(const std::string& hub_ip, int hub_port, int my_port)
     inet_pton(AF_INET, hub_ip.c_str(), &sa.sin_addr);
     if (connect(sock, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
         close(sock);
+        std::cerr << "[Daemon] Failed to connect to Hub at " << hub_ip << ":" << hub_port << std::endl;
         return;
     }
 
-    std::string my_addr = "127.0.0.1:" + std::to_string(my_port);
+    RegisterNodeReq req;
+    strncpy(req.ip, "127.0.0.1", sizeof(req.ip) - 1); // Ideally, get actual IP
+    req.port = my_port;
+    req.capacity = capacity;
+
     NetMeta     meta{Action::kHubRegisterNode, 0, "", ""};
-    NetHeader   hdr{0x504F4B45, sizeof(NetMeta), (uint32_t)my_addr.size()};
+    NetHeader   hdr{0x504F4B45, sizeof(NetMeta), sizeof(RegisterNodeReq)};
+
     send(sock, &hdr, sizeof(hdr), 0);
     send(sock, &meta, sizeof(meta), 0);
-    send(sock, my_addr.data(), my_addr.size(), 0);
+    send(sock, &req, sizeof(req), 0);
 
     NetHeader rh;
     recv(sock, &rh, sizeof(rh), MSG_WAITALL);
     NetRespMeta rm;
     recv(sock, &rm, sizeof(rm), MSG_WAITALL);
     if (rm.status > 0)
-        std::cout << "[Daemon] Registered to Hub." << std::endl;
+        std::cout << "[Daemon] Registered to Hub with " << capacity.num_gpus << " GPUs." << std::endl;
+    else
+        std::cerr << "[Daemon] Registration failed." << std::endl;
     close(sock);
 }
 
@@ -58,8 +66,26 @@ void handle_client(int client_fd, Agent* agent)
 
         if (meta.action == Action::kNetSpawn) {
             std::cout << "[Daemon] Spawning: " << meta.actor_type << std::endl;
-            agent->spawnActor(meta.actor_type, meta.actor_id);
-            std::cout << "[Daemon] Spawned actor: " << meta.actor_id << std::endl;
+
+            // Check for V2 Spawn Body
+            std::vector<int> gpu_ids;
+            if (body.size() >= sizeof(SpawnActorReq)) {
+                // V2 Launch (with Resource Spec)
+                const auto* req = reinterpret_cast<const SpawnActorReq*>(body.data());
+                for (int i=0; i<8; ++i) {
+                    if (req->assigned_gpu_ids[i] >= 0) {
+                        gpu_ids.push_back(req->assigned_gpu_ids[i]);
+                    }
+                }
+                // Args are after the struct, if any (not implemented yet)
+            } else {
+                // Legacy V1 Spawn (Empty Body or just string args)
+                // Default: no GPU isolation
+            }
+
+            agent->spawnActor(meta.actor_type, meta.actor_id, gpu_ids);
+            std::cout << "[Daemon] Spawned actor: " << meta.actor_id
+                      << " GPUs: " << gpu_ids.size() << std::endl;
 
             // Send Ack
             NetHeader   rh{0x504F4B45, sizeof(NetRespMeta), 0};
@@ -70,8 +96,8 @@ void handle_client(int client_fd, Agent* agent)
         else {
             auto        future = agent->callRemoteRaw(meta.actor_id, meta.action, body);
             std::string res    = future.get();
-            std::cout << "[Daemon] Received result from actor. Size: " << res.size() << ". Sending to client..."
-                      << std::endl;
+            // std::cout << "[Daemon] Received result from actor. Size: " << res.size() << ". Sending to client..."
+            //           << std::endl;
 
             NetHeader   rh{0x504F4B45, sizeof(NetRespMeta), (uint32_t)res.size()};
             NetRespMeta rm{meta.seq_id, 1};
@@ -82,7 +108,7 @@ void handle_client(int client_fd, Agent* agent)
             if (!res.empty())
                 if (send(client_fd, res.data(), res.size(), 0) < 0)
                     perror("[Daemon] Failed to send body");
-            std::cout << "[Daemon] Response sent to client." << std::endl;
+            // std::cout << "[Daemon] Response sent to client." << std::endl;
         }
     }
     close(client_fd);
@@ -93,11 +119,24 @@ int run_daemon(int argc, char** argv)
     int         my_port  = 9000;
     std::string hub_ip   = "";
     int         hub_port = 8888;
-    if (argc > 1)
-        my_port = atoi(argv[1]);
-    if (argc > 3) {
-        hub_ip   = argv[2];
-        hub_port = atoi(argv[3]);
+    ResourceSpec capacity{0, 0};
+
+    // Argument Parsing (Simple)
+    // Usage: ./agent <port> <hub_ip> <hub_port> [--gpus <n>]
+    std::vector<std::string> args;
+    for(int i=0; i<argc; ++i) args.push_back(argv[i]);
+
+    if (args.size() > 1) my_port = std::stoi(args[1]);
+    if (args.size() > 3) {
+        hub_ip = args[2];
+        hub_port = std::stoi(args[3]);
+    }
+
+    for (size_t i = 1; i < args.size(); ++i) {
+        if (args[i] == "--gpus" && i + 1 < args.size()) {
+            capacity.num_gpus = std::stoi(args[i+1]);
+            i++;
+        }
     }
 
     Agent local_agent;
@@ -117,7 +156,7 @@ int run_daemon(int argc, char** argv)
     std::cout << "[Daemon] Listening on " << my_port << "..." << std::endl;
 
     if (!hub_ip.empty())
-        register_to_hub(hub_ip, hub_port, my_port);
+        register_to_hub(hub_ip, hub_port, my_port, capacity);
 
     // Setup signal handling for graceful shutdown
     static bool g_running = true;

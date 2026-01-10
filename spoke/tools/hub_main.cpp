@@ -3,6 +3,7 @@
 #include <thread>
 #include <unistd.h>
 #include <vector>
+#include <cstring>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -35,24 +36,81 @@ void handle_connection(int fd)
 
     std::string resp_body;
     int         status = 0;
+
     if (meta.action == Action::kHubRegisterNode) {
-        char ip[64];
-        int  port;
-        if (sscanf(req_body.c_str(), "%[^:]:%d", ip, &port) == 2) {
-            g_hub.registerNode(ip, port);
+        if (req_body.size() >= sizeof(RegisterNodeReq)) {
+            const auto* req = reinterpret_cast<const RegisterNodeReq*>(req_body.data());
+            g_hub.registerNode(req->ip, req->port, req->capacity);
             status = 1;
-            std::cout << "[Hub] Node Registered: " << ip << ":" << port << std::endl;
+        } else {
+             std::cerr << "[Hub] Invalid RegisterNodeReq size" << std::endl;
+             status = -1;
         }
     }
     else if (meta.action == Action::kHubFindNode) {
         NodeInfo node;
-        if (g_hub.scheduleNode(&node)) {
+        ResourceSpec req_spec = {0, 0};
+
+        if (req_body.size() >= sizeof(FindNodeReq)) {
+            const auto* req = reinterpret_cast<const FindNodeReq*>(req_body.data());
+            req_spec = req->requirements;
+        }
+
+        if (g_hub.scheduleNode(req_spec, &node)) {
             status    = 1;
             resp_body = node.ip + ":" + std::to_string(node.port);
-            std::cout << "[Hub] Assigned " << resp_body << std::endl;
         }
         else {
             status = -1;
+        }
+    }
+    else if (meta.action == Action::kNetAllocate) {
+        if (req_body.size() >= sizeof(AllocateReq)) {
+            const auto* req = reinterpret_cast<const AllocateReq*>(req_body.data());
+
+            std::string ticket;
+            std::vector<AllocatedSlot> slots;
+
+            if (g_hub.gangAllocate(*req, ticket, slots)) {
+                status = 1;
+
+                // Serialize Response
+                // Header: AllocateResp (fixed size)
+                // Body: vector<AllocatedSlot> (variable size)
+                AllocateResp resp;
+                memset(&resp, 0, sizeof(resp));
+                strncpy(resp.ticket_id, ticket.c_str(), 63);
+                resp.num_members = (uint32_t)slots.size();
+
+                resp_body.resize(sizeof(AllocateResp) + slots.size() * sizeof(AllocatedSlot));
+                memcpy(resp_body.data(), &resp, sizeof(AllocateResp));
+                memcpy(resp_body.data() + sizeof(AllocateResp), slots.data(), slots.size() * sizeof(AllocatedSlot));
+            } else {
+                status = -1; // Allocation failed
+            }
+        } else {
+             std::cerr << "[Hub] Invalid AllocateReq size" << std::endl;
+             status = -1;
+        }
+    }
+    else if (meta.action == Action::kNetLaunch) {
+        // req_body = LaunchReq + (Optional Args Body)
+        if (req_body.size() >= sizeof(LaunchReq)) {
+            const auto* req = reinterpret_cast<const LaunchReq*>(req_body.data());
+
+            std::string args_body;
+            if (req_body.size() > sizeof(LaunchReq)) {
+                args_body = req_body.substr(sizeof(LaunchReq));
+            }
+
+            if (g_hub.launchActor(*req, meta.actor_type, meta.actor_id, args_body)) {
+                status = 1;
+            } else {
+                status = -1;
+            }
+        } else {
+             std::cerr << "[Hub] Invalid LaunchReq size" << std::endl;
+             status = -1;
         }
     }
 

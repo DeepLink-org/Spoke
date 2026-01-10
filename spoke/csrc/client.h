@@ -67,6 +67,136 @@ public:
         }
     }
 
+    // [New] V2 Allocation API
+    std::future<AllocateResp> gangAllocate(uint32_t num_nodes, uint32_t actors_per_node,
+                                                const ResourceSpec& res_per_actor, bool strict_pack = true)
+    {
+        auto prom = std::make_shared<std::promise<AllocateResp>>();
+        auto fut  = prom->get_future();
+
+        if (!use_hub_) {
+            try { throw std::runtime_error("gangAllocate requires Hub mode"); }
+            catch(...) { prom->set_exception(std::current_exception()); }
+            return fut;
+        }
+
+        // Connect to Hub (Temporary connection for this request)
+        // Note: For production, maintain a persistent connection to Hub
+        int hs = socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in sa;
+        sa.sin_family = AF_INET;
+        sa.sin_port   = htons(hub_port_);
+        inet_pton(AF_INET, hub_ip_.c_str(), &sa.sin_addr);
+        if (connect(hs, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
+            close(hs);
+            try { throw std::runtime_error("Failed to connect to Hub"); }
+            catch(...) { prom->set_exception(std::current_exception()); }
+            return fut;
+        }
+
+        AllocateReq req;
+        req.num_nodes = num_nodes;
+        req.actors_per_node = actors_per_node;
+        req.res_per_actor = res_per_actor;
+        req.strict_pack = strict_pack;
+
+        NetMeta   meta{Action::kNetAllocate, seq_++, "", ""};
+        NetHeader hdr{0x504F4B45, sizeof(NetMeta), sizeof(AllocateReq)};
+
+        send(hs, &hdr, sizeof(hdr), 0);
+        send(hs, &meta, sizeof(meta), 0);
+        send(hs, &req, sizeof(req), 0);
+
+        // Receive Response
+        NetHeader rh;
+        recv(hs, &rh, sizeof(rh), MSG_WAITALL);
+        NetRespMeta rm;
+        recv(hs, &rm, sizeof(rm), MSG_WAITALL);
+
+        if (rm.status <= 0) {
+            close(hs);
+            try { throw std::runtime_error("Allocation rejected by Hub"); }
+            catch(...) { prom->set_exception(std::current_exception()); }
+            return fut;
+        }
+
+        // Parse Body
+        // Body = AllocateResp + Slots...
+        std::vector<char> body(rh.data_size);
+        recv(hs, body.data(), rh.data_size, MSG_WAITALL);
+        close(hs);
+
+        if (body.size() < sizeof(AllocateResp)) {
+             try { throw std::runtime_error("Invalid allocation response size"); }
+             catch(...) { prom->set_exception(std::current_exception()); }
+             return fut;
+        }
+
+        AllocateResp resp;
+        memcpy(&resp, body.data(), sizeof(AllocateResp));
+
+        prom->set_value(resp);
+        return fut;
+    }
+
+    // [New] V2 Launch API
+    std::future<bool> launchActor(const std::string& ticket_id, uint32_t global_rank,
+                                  const std::string& type, const std::string& id, const std::string& args_serialized)
+    {
+        auto prom = std::make_shared<std::promise<bool>>();
+        auto fut  = prom->get_future();
+
+        if (!use_hub_) {
+            try { throw std::runtime_error("launchActor requires Hub mode"); }
+            catch(...) { prom->set_exception(std::current_exception()); }
+            return fut;
+        }
+
+        int hs = socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in sa;
+        sa.sin_family = AF_INET;
+        sa.sin_port   = htons(hub_port_);
+        inet_pton(AF_INET, hub_ip_.c_str(), &sa.sin_addr);
+        if (connect(hs, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
+            close(hs);
+            try { throw std::runtime_error("Failed to connect to Hub"); }
+            catch(...) { prom->set_exception(std::current_exception()); }
+            return fut;
+        }
+
+        LaunchReq req;
+        memset(&req, 0, sizeof(req));
+        strncpy(req.ticket_id, ticket_id.c_str(), 63);
+        req.global_rank = global_rank;
+
+        // Payload = LaunchReq + Args
+        std::vector<char> payload(sizeof(LaunchReq) + args_serialized.size());
+        memcpy(payload.data(), &req, sizeof(LaunchReq));
+        if (!args_serialized.empty()) {
+            memcpy(payload.data() + sizeof(LaunchReq), args_serialized.data(), args_serialized.size());
+        }
+
+        NetMeta   meta{Action::kNetLaunch, seq_++, "", ""};
+        strncpy(meta.actor_id, id.c_str(), 31);
+        strncpy(meta.actor_type, type.c_str(), 31);
+
+        NetHeader hdr{0x504F4B45, sizeof(NetMeta), (uint32_t)payload.size()};
+
+        send(hs, &hdr, sizeof(hdr), 0);
+        send(hs, &meta, sizeof(meta), 0);
+        send(hs, payload.data(), payload.size(), 0);
+
+        NetHeader rh;
+        recv(hs, &rh, sizeof(rh), MSG_WAITALL);
+        NetRespMeta rm;
+        recv(hs, &rm, sizeof(rm), MSG_WAITALL);
+
+        close(hs);
+
+        prom->set_value(rm.status > 0);
+        return fut;
+    }
+
     void spawnRemote(const std::string& type, const std::string& id)
     {
         if (use_hub_) {

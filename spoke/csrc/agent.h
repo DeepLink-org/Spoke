@@ -45,7 +45,8 @@ public:
     // ==========================================
     // [v5 核心] 工厂模式启动 (供 Daemon 使用)
     // ==========================================
-    pid_t spawnActor(const std::string& type, const std::string& id)
+    // [Updated V2] Supports GPU isolation via environment variables
+    pid_t spawnActor(const std::string& type, const std::string& id, const std::vector<int>& gpu_ids = {})
     {
         // Enforce serialized forking to avoid multi-thread fork hazards
         std::lock_guard<std::mutex> fork_lk(spawn_mtx_);
@@ -98,6 +99,22 @@ public:
 
             // Ensure child dies if parent (Daemon) dies
             prctl(PR_SET_PDEATHSIG, SIGTERM);
+
+            // [New] Set Environment Variables for GPU Isolation
+            if (!gpu_ids.empty()) {
+                std::string gpu_str = "";
+                for (size_t i = 0; i < gpu_ids.size(); ++i) {
+                    gpu_str += std::to_string(gpu_ids[i]);
+                    if (i < gpu_ids.size() - 1) gpu_str += ",";
+                }
+                setenv("CUDA_DEVICE_ORDER", "PCI_BUS_ID", 1);
+                setenv("CUDA_VISIBLE_DEVICES", gpu_str.c_str(), 1);
+                // Also set ROCR_VISIBLE_DEVICES for AMD, just in case
+                setenv("ROCR_VISIBLE_DEVICES", gpu_str.c_str(), 1);
+
+                // For debugging
+                // fprintf(stderr, "[Child] Set CUDA_VISIBLE_DEVICES=%s\n", gpu_str.c_str());
+            }
 
             execv(exe_path, args.data());
 
