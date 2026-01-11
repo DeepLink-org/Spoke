@@ -19,7 +19,7 @@ Spoke is a lightweight, low-latency distributed task execution framework designe
 
 ## 📚 Documentation
 
-- [**V2 User Guide (Gang Scheduling)**](../../docs/spoke_v2_user_guide.md): Detailed guide on using the new allocation and launch APIs.
+- [**V2 User Guide (Gang Scheduling)**](docs/spoke_v2_user_guide.md): Detailed guide on using the new allocation and launch APIs.
 
 ## 🛠️ Core Components
 
