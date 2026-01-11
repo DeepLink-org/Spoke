@@ -113,6 +113,19 @@ void handle_connection(int fd)
              status = -1;
         }
     }
+    else if (meta.action == Action::kNetRelease) {
+        if (req_body.size() >= sizeof(ReleaseReq)) {
+            const auto* req = reinterpret_cast<const ReleaseReq*>(req_body.data());
+            if (g_hub.gangRelease(req->ticket_id)) {
+                status = 1;
+            } else {
+                status = -1;
+            }
+        } else {
+            std::cerr << "[Hub] Invalid ReleaseReq size" << std::endl;
+            status = -1;
+        }
+    }
 
     NetHeader   rh{0x504F4B45, sizeof(NetRespMeta), (uint32_t)resp_body.size()};
     NetRespMeta rm{meta.seq_id, status};

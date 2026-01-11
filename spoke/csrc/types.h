@@ -14,6 +14,7 @@ enum class Action : uint32_t {
     kHubFindNode     = 0x31,
     kNetAllocate     = 0x32,  // [New] V2 Allocation
     kNetLaunch       = 0x33,  // [New] V2 Launch
+    kNetRelease      = 0x34,  // [New] V2 Release
     kUserActionStart = 0x10
 };
 
@@ -100,6 +101,11 @@ struct SpawnActorReq {
     ResourceSpec resources;
     int32_t assigned_gpu_ids[8]; // Fixed size for simplicity, supports up to 8 GPUs
     // Followed by args...
+};
+
+// [New] Release Request (Client -> Hub)
+struct ReleaseReq {
+    char ticket_id[64];
 };
 
 }  // namespace spoke

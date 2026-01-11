@@ -245,6 +245,37 @@ public:
         return false;
     }
 
+    // [New] Release allocated resources
+    bool gangRelease(const std::string& ticket_id)
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        auto it = allocations_.find(ticket_id);
+        if (it == allocations_.end()) {
+            std::cerr << "[Hub] Release Failed: Invalid Ticket " << ticket_id << std::endl;
+            return false;
+        }
+
+        AllocationState& state = it->second;
+        std::cout << "[Hub] Releasing resources for Ticket: " << ticket_id << std::endl;
+
+        // Update node resources
+        for (const auto& slot : state.slots) {
+            for (auto& node : nodes_) {
+                if (node.ip == slot.node_ip && node.port == slot.node_port) {
+                    node.load--;
+                    node.used.num_gpus -= state.res_per_actor.num_gpus;
+                    std::cout << "[Hub]   -> Node " << node.ip << ":" << node.port
+                              << " recovered " << state.res_per_actor.num_gpus << " GPU(s). "
+                              << "Free GPUs: " << (node.total.num_gpus - node.used.num_gpus)
+                              << std::endl;
+                    break;
+                }
+            }
+        }
+        allocations_.erase(it);
+        return true;
+    }
+
 private:
     std::string generateTicket() {
         static std::random_device rd;

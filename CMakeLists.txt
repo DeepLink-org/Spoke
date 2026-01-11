@@ -23,7 +23,9 @@ set(BUILD_PYTHON OFF CACHE BOOL "Disable Python bindings" FORCE)
 set(BUILD_TEST OFF CACHE BOOL "Disable Tests" FORCE)
 set(BUILD_BENCH OFF CACHE BOOL "Disable Benchmarks" FORCE)
 # Use object library mode or static to avoid rpath hell? No, shared is fine if handled right.
-add_subdirectory(third_party/DLSlime)
+if(NOT TARGET dlslime)
+    add_subdirectory(third_party/DLSlime)
+endif()
 
 # Header files installation
 file(GLOB SPOKE_HEADERS

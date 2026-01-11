@@ -8,6 +8,7 @@
 #include <iostream>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <sys/socket.h>
 #include <thread>
@@ -28,23 +29,56 @@ public:
         connectToDaemon(ip, port);
     }
 
-    Client(const std::string& hub_ip, int hub_port, bool is_hub_mode):
-        hub_ip_(hub_ip), hub_port_(hub_port), use_hub_(is_hub_mode)
+    Client(const std::string& ip, int port, bool is_hub_mode):
+        use_hub_(is_hub_mode)
     {
+        if (is_hub_mode) {
+            hub_ip_ = ip;
+            hub_port_ = port;
+            // In Hub mode, we don't connect to a daemon until spawnRemote or gangAllocate is called
+        } else {
+            target_ip_ = ip;
+            target_port_ = port;
+            connectToDaemon(ip, port);
+        }
     }
 
     ~Client()
     {
+        // Step 1: Collect tickets to release (minimize lock holding time)
+        std::vector<std::string> tickets_to_release;
+        {
+            std::lock_guard<std::mutex> lk(ticket_mtx_);
+            tickets_to_release.assign(allocated_tickets_.begin(), allocated_tickets_.end());
+            allocated_tickets_.clear();
+        }
+
+        // Step 2: Release gang allocations BEFORE stopping threads (needs network)
+        for (const auto& ticket : tickets_to_release) {
+            std::cerr << "[Client] Auto-releasing unreleased ticket: " << ticket << std::endl;
+            try {
+                gangReleaseSync(ticket);
+            }
+            catch (const std::exception& e) {
+                std::cerr << "[Client] Failed to auto-release ticket " << ticket << ": " << e.what() << std::endl;
+            }
+        }
+
+        // Step 3: Signal threads to stop
         running_ = false;
+        rdma_ready_ = false;
+
+        // Step 4: Shutdown connections to unblock recv loops
         if (sock_ != -1) {
             shutdown(sock_, SHUT_RDWR);
             close(sock_);
+            sock_ = -1;
         }
         if (rdma_ep_) {
-            rdma_ready_ = false;  // Signal recv loop to exit
             rdma_ep_->shutdown();
         }
 
+        // Step 5: Wait for socket receiver thread (usually exits quickly after shutdown)
         try {
             if (receiver_thread_.joinable()) {
                 if (receiver_thread_.get_id() == std::this_thread::get_id()) {
@@ -54,16 +88,30 @@ public:
                     receiver_thread_.join();
                 }
             }
-            if (rdma_receiver_thread_.joinable()) {
-                if (rdma_receiver_thread_.get_id() == std::this_thread::get_id()) {
-                    rdma_receiver_thread_.detach();
-                }
-                else {
-                    rdma_receiver_thread_.join();
-                }
+        }
+        catch (const std::exception& e) {
+            std::cerr << "[Client] Exception joining receiver_thread: " << e.what() << std::endl;
+            if (receiver_thread_.joinable()) {
+                receiver_thread_.detach();
             }
         }
         catch (...) {
+            if (receiver_thread_.joinable()) {
+                receiver_thread_.detach();
+            }
+        }
+
+        // Step 6: RDMA receiver thread - detach instead of join
+        // RDMA's immRecv() may not respond to shutdown() properly, causing deadlock on join.
+        // Since we're in destructor and resources are already released, detach is safe.
+        // The OS will clean up when the process exits.
+        try {
+            if (rdma_receiver_thread_.joinable()) {
+                rdma_receiver_thread_.detach();
+            }
+        }
+        catch (...) {
+            // Ignore - we're exiting anyway
         }
     }
 
@@ -134,6 +182,30 @@ public:
 
         AllocateResp resp;
         memcpy(&resp, body.data(), sizeof(AllocateResp));
+
+        // Track ticket for auto-release on destruction
+        {
+            std::lock_guard<std::mutex> lk(ticket_mtx_);
+            allocated_tickets_.insert(std::string(resp.ticket_id));
+        }
+
+        // [Auto-Connect] Connect to the first node in the allocation
+        // This is necessary because Client (currently) maintains a single connection for callRemote
+        if (resp.num_members > 0) {
+            size_t slots_offset = sizeof(AllocateResp);
+            size_t expected_size = slots_offset + resp.num_members * sizeof(AllocatedSlot);
+            
+            if (body.size() >= expected_size) {
+                const AllocatedSlot* slots = reinterpret_cast<const AllocatedSlot*>(body.data() + slots_offset);
+                // Only connect if not already connected
+                if (sock_ == -1) {
+                    std::string node_ip = slots[0].node_ip;
+                    int node_port = slots[0].node_port;
+                    std::cout << "[Client] Auto-connecting to allocated node: " << node_ip << ":" << node_port << std::endl;
+                    connectToDaemon(node_ip, node_port);
+                }
+            }
+        }
 
         prom->set_value(resp);
         return fut;
@@ -247,6 +319,57 @@ public:
         NetMeta  meta{Action::kStop, sid, "", ""};
         strncpy(meta.actor_id, id.c_str(), 31);
         sendRequest(meta, "");
+    }
+
+    // [New] Release allocated resources (Gang Release)
+    std::future<bool> gangRelease(const std::string& ticket_id)
+    {
+        auto prom = std::make_shared<std::promise<bool>>();
+        auto fut  = prom->get_future();
+
+        if (!use_hub_) {
+            try { throw std::runtime_error("gangRelease requires Hub mode"); }
+            catch(...) { prom->set_exception(std::current_exception()); }
+            return fut;
+        }
+
+        int hs = socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in sa;
+        sa.sin_family = AF_INET;
+        sa.sin_port   = htons(hub_port_);
+        inet_pton(AF_INET, hub_ip_.c_str(), &sa.sin_addr);
+        if (connect(hs, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
+            close(hs);
+            try { throw std::runtime_error("Failed to connect to Hub for release"); }
+            catch(...) { prom->set_exception(std::current_exception()); }
+            return fut;
+        }
+
+        ReleaseReq req;
+        strncpy(req.ticket_id, ticket_id.c_str(), 63);
+
+        NetMeta   meta{Action::kNetRelease, seq_++, "", ""};
+        NetHeader hdr{0x504F4B45, sizeof(NetMeta), sizeof(ReleaseReq)};
+
+        send(hs, &hdr, sizeof(hdr), 0);
+        send(hs, &meta, sizeof(meta), 0);
+        send(hs, &req, sizeof(req), 0);
+
+        NetHeader rh;
+        recv(hs, &rh, sizeof(rh), MSG_WAITALL);
+        NetRespMeta rm;
+        recv(hs, &rm, sizeof(rm), MSG_WAITALL);
+
+        close(hs);
+        
+        // Remove ticket from tracking on successful release
+        if (rm.status > 0) {
+            std::lock_guard<std::mutex> lk(ticket_mtx_);
+            allocated_tickets_.erase(ticket_id);
+        }
+        
+        prom->set_value(rm.status > 0);
+        return fut;
     }
 
     // [关键更新] 泛型调用，使用 Pack/Unpack
@@ -410,6 +533,46 @@ public:
     bool                                   rdma_ready_      = false;
 
 private:
+    // Synchronous version of gangRelease for use in destructor
+    // Note: Does NOT modify allocated_tickets_ (caller handles it)
+    void gangReleaseSync(const std::string& ticket_id)
+    {
+        if (!use_hub_) {
+            return;
+        }
+
+        int hs = socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in sa;
+        sa.sin_family = AF_INET;
+        sa.sin_port   = htons(hub_port_);
+        inet_pton(AF_INET, hub_ip_.c_str(), &sa.sin_addr);
+        if (connect(hs, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
+            close(hs);
+            throw std::runtime_error("Failed to connect to Hub for release");
+        }
+
+        ReleaseReq req;
+        strncpy(req.ticket_id, ticket_id.c_str(), 63);
+
+        NetMeta   meta{Action::kNetRelease, seq_++, "", ""};
+        NetHeader hdr{0x504F4B45, sizeof(NetMeta), sizeof(ReleaseReq)};
+
+        send(hs, &hdr, sizeof(hdr), 0);
+        send(hs, &meta, sizeof(meta), 0);
+        send(hs, &req, sizeof(req), 0);
+
+        NetHeader rh;
+        recv(hs, &rh, sizeof(rh), MSG_WAITALL);
+        NetRespMeta rm;
+        recv(hs, &rm, sizeof(rm), MSG_WAITALL);
+
+        close(hs);
+        
+        if (rm.status <= 0) {
+            throw std::runtime_error("Release request rejected by Hub");
+        }
+    }
+
     void connectToDaemon(const std::string& ip, int port)
     {
         if (sock_ != -1) {
@@ -543,6 +706,10 @@ private:
     std::string                                                 target_ip_;
     int                                                         target_port_;
     std::map<uint32_t, std::function<void(const std::string&)>> response_handlers_;
+
+    // Track allocated tickets for auto-release on destruction
+    std::set<std::string> allocated_tickets_;
+    std::mutex            ticket_mtx_;
 
 };  // class Client
 
