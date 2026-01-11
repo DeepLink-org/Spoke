@@ -97,21 +97,21 @@ void handle_client(int client_fd, Agent* agent)
             // [Fix] For user actions, dispatch asynchronously and handle responses in background
             // This allows collective operations (like NVSHMEM barriers) to work correctly
             auto future = agent->callRemoteRaw(meta.actor_id, meta.action, body);
-            
+
             // Capture by value for thread safety
             uint32_t seq_id_copy = meta.seq_id;
             int client_fd_copy = client_fd;
-            
+
             std::thread([future = std::move(future), seq_id_copy, client_fd_copy]() mutable {
                 std::string res = future.get();
-                
+
                 NetHeader   rh{0x504F4B45, sizeof(NetRespMeta), (uint32_t)res.size()};
                 NetRespMeta rm{seq_id_copy, 1};
-                
+
                 // Use a static mutex to serialize sends to same client_fd
                 static std::mutex send_mtx;
                 std::lock_guard<std::mutex> lk(send_mtx);
-                
+
                 if (send(client_fd_copy, &rh, sizeof(rh), 0) < 0)
                     perror("[Daemon] Failed to send header");
                 if (send(client_fd_copy, &rm, sizeof(rm), 0) < 0)

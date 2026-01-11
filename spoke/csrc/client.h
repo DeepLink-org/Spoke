@@ -194,7 +194,7 @@ public:
         if (resp.num_members > 0) {
             size_t slots_offset = sizeof(AllocateResp);
             size_t expected_size = slots_offset + resp.num_members * sizeof(AllocatedSlot);
-            
+
             if (body.size() >= expected_size) {
                 const AllocatedSlot* slots = reinterpret_cast<const AllocatedSlot*>(body.data() + slots_offset);
                 // Only connect if not already connected
@@ -361,13 +361,13 @@ public:
         recv(hs, &rm, sizeof(rm), MSG_WAITALL);
 
         close(hs);
-        
+
         // Remove ticket from tracking on successful release
         if (rm.status > 0) {
             std::lock_guard<std::mutex> lk(ticket_mtx_);
             allocated_tickets_.erase(ticket_id);
         }
-        
+
         prom->set_value(rm.status > 0);
         return fut;
     }
@@ -567,7 +567,7 @@ private:
         recv(hs, &rm, sizeof(rm), MSG_WAITALL);
 
         close(hs);
-        
+
         if (rm.status <= 0) {
             throw std::runtime_error("Release request rejected by Hub");
         }
