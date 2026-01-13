@@ -98,6 +98,7 @@ struct LaunchReq {
 // [New] Spawn Request Body (Hub -> Agent)
 // Replaces the empty body of kNetSpawn for V2 calls
 struct SpawnActorReq {
+    char ticket_id[64];
     ResourceSpec resources;
     int32_t assigned_gpu_ids[8]; // Fixed size for simplicity, supports up to 8 GPUs
     // Followed by args...

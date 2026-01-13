@@ -31,7 +31,13 @@ struct AllocationState {
     std::string ticket_id;
     std::vector<AllocatedSlot> slots;
     ResourceSpec res_per_actor;
-    // timestamp, expiration, etc.
+
+    struct LaunchedActor {
+        std::string actor_id;
+        std::string node_ip;
+        int node_port;
+    };
+    std::vector<LaunchedActor> launched_actors;
 };
 
 class Hub {
@@ -202,6 +208,7 @@ public:
         // 3. Construct SpawnActorReq (The Payload for Agent)
         SpawnActorReq spawn_req;
         memset(&spawn_req, 0, sizeof(spawn_req));
+        strncpy(spawn_req.ticket_id, req.ticket_id, 63);
         spawn_req.resources = state.res_per_actor;
 
         // Fill assigned GPUs
@@ -236,6 +243,7 @@ public:
         close(agent_sock);
 
         if (rm.status > 0) {
+            state.launched_actors.push_back({actor_id, slot.node_ip, slot.node_port});
             std::cout << "[Hub] Launched Rank " << req.global_rank
                       << " (" << actor_id << ") on " << slot.node_ip
                       << " GPU:" << slot.gpu_id << std::endl;
@@ -258,7 +266,31 @@ public:
         AllocationState& state = it->second;
         std::cout << "[Hub] Releasing resources for Ticket: " << ticket_id << std::endl;
 
-        // Update node resources
+        // 1. Physically STOP all launched actors
+        for (const auto& la : state.launched_actors) {
+            std::cout << "[Hub]   -> Stopping actor: " << la.actor_id << " on " << la.node_ip << ":" << la.node_port << std::endl;
+
+            int agent_sock = socket(AF_INET, SOCK_STREAM, 0);
+            struct sockaddr_in sa;
+            sa.sin_family = AF_INET;
+            sa.sin_port   = htons(la.node_port);
+            inet_pton(AF_INET, la.node_ip.c_str(), &sa.sin_addr);
+
+            if (connect(agent_sock, (struct sockaddr*)&sa, sizeof(sa)) >= 0) {
+                NetMeta meta{Action::kStop, 0, "", ""};
+                strncpy(meta.actor_id, la.actor_id.c_str(), 31);
+                NetHeader hdr{0x504F4B45, sizeof(NetMeta), 0};
+
+                send(agent_sock, &hdr, sizeof(hdr), 0);
+                send(agent_sock, &meta, sizeof(meta), 0);
+                close(agent_sock);
+            } else {
+                std::cerr << "[Hub]   -> Failed to connect to Agent to stop actor " << la.actor_id << std::endl;
+                close(agent_sock);
+            }
+        }
+
+        // 2. Update node resources (Bookkeeping)
         for (const auto& slot : state.slots) {
             for (auto& node : nodes_) {
                 if (node.ip == slot.node_ip && node.port == slot.node_port) {

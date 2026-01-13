@@ -8,7 +8,7 @@
 int main(int argc, char** argv)
 {
     std::string hub_ip   = "127.0.0.1";
-    int         hub_port = 8888;
+    int         hub_port = 23760;
     if (argc > 1) hub_port = atoi(argv[1]);
 
     std::cout << "[Smoke v7] Connecting to Hub for Gang Allocation..." << std::endl;

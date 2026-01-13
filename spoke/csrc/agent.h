@@ -16,6 +16,13 @@
 #include <thread>
 #include <unistd.h>
 #include <vector>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <chrono>
+#include <ctime>
+#include <sstream>
+#include <iomanip>
+#include <filesystem>
 
 namespace spoke {
 
@@ -28,6 +35,14 @@ struct ActorHandle {
 class Agent {
 public:
     Agent(): monitor_thread_(&Agent::monitor, this) {}
+
+    void setLogDir(const std::string& dir) {
+        log_dir_ = dir;
+        // Remove trailing slash if present for consistency, though filesystem handles it
+        if (!log_dir_.empty() && log_dir_.back() == '/') {
+            log_dir_.pop_back();
+        }
+    }
 
     ~Agent()
     {
@@ -45,12 +60,13 @@ public:
     // ==========================================
     // [v5 核心] 工厂模式启动 (供 Daemon 使用)
     // ==========================================
-    // [Updated V2] Supports GPU isolation via environment variables
-    pid_t spawnActor(const std::string& type, const std::string& id, const std::vector<int>& gpu_ids = {})
+    // [Updated V2] Supports GPU isolation via environment variables and log isolation
+    pid_t spawnActor(const std::string& type, const std::string& id, const std::vector<int>& gpu_ids = {}, const std::string& group_id = "")
     {
         // Enforce serialized forking to avoid multi-thread fork hazards
         std::lock_guard<std::mutex> fork_lk(spawn_mtx_);
 
+        // ... (rest of the initial logic before fork)
         // Fix: Cleanup existing actor if ID collision
         {
             std::lock_guard<std::mutex> lk(mtx_);
@@ -99,6 +115,47 @@ public:
 
             // Ensure child dies if parent (Daemon) dies
             prctl(PR_SET_PDEATHSIG, SIGTERM);
+
+            // [New] Redirect stdout/stderr to log file with timestamp (Actor Isolation)
+            {
+                // Generate filename: <log_dir>/<group_id>/<id>_<timestamp>.log
+                std::string current_log_dir = log_dir_;
+                if (!group_id.empty()) {
+                    current_log_dir += "/" + group_id;
+                }
+
+                // Ensure logs directory exists
+                std::filesystem::create_directories(current_log_dir);
+
+                auto now = std::chrono::system_clock::now();
+                auto in_time_t = std::chrono::system_clock::to_time_t(now);
+                std::stringstream ss;
+                ss << std::put_time(std::localtime(&in_time_t), "%Y%m%d_%H%M%S");
+
+                std::string log_file = current_log_dir + "/" + id + "_" + ss.str() + ".log";
+
+                int fd = open(log_file.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                if (fd >= 0) {
+                    // Redirect stdout and stderr
+                    if (dup2(fd, STDOUT_FILENO) < 0) perror("dup2 stdout");
+                    if (dup2(fd, STDERR_FILENO) < 0) perror("dup2 stderr");
+                    close(fd);
+
+                    // Force flush to ensure file is written to immediately
+                    setbuf(stdout, NULL);
+                    setbuf(stderr, NULL);
+
+                    std::cout << "==================================================" << std::endl;
+                    std::cout << " Spoke Actor Log: " << id << std::endl;
+                    if (!group_id.empty()) {
+                        std::cout << " Group/Ticket:    " << group_id << std::endl;
+                    }
+                    std::cout << " Started at:      " << ss.str() << std::endl;
+                    std::cout << "==================================================" << std::endl;
+                } else {
+                    fprintf(stderr, "[Spoke] Failed to open log file %s\n", log_file.c_str());
+                }
+            }
 
             // [New] Set Environment Variables for GPU Isolation
             if (!gpu_ids.empty()) {
@@ -297,6 +354,7 @@ private:
     std::atomic<uint32_t>                                          seq_{0};
     std::atomic<bool>                                              running_{true};
     std::thread                                                    monitor_thread_;
+    std::string                                                    log_dir_ = ".spoke/logs";
 };
 
 }  // namespace spoke
