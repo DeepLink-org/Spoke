@@ -22,6 +22,25 @@
 
 namespace spoke {
 
+struct RdmaChannel {
+    std::shared_ptr<dlslime::RDMAEndpoint> ep;
+    char*                                  local_buf       = nullptr;
+    size_t                                 local_buf_size  = 0;
+    uintptr_t                              remote_addr     = 0;
+    size_t                                 remote_buf_size = 0;
+    std::thread                            receiver_thread;
+    std::atomic<bool>                      running{true};
+
+    ~RdmaChannel() {
+        running = false;
+        if (ep) ep->shutdown();
+        if (receiver_thread.joinable()) {
+            receiver_thread.detach(); // Safer in destructor
+        }
+        if (local_buf) delete[] local_buf;
+    }
+};
+
 class Client {
 public:
     Client(const std::string& ip, int port): target_ip_(ip), target_port_(port), use_hub_(false)
@@ -66,19 +85,21 @@ public:
 
         // Step 3: Signal threads to stop
         running_ = false;
-        rdma_ready_ = false;
 
-        // Step 4: Shutdown connections to unblock recv loops
+        // Step 4: Shutdown RDMA channels
+        {
+            std::lock_guard<std::mutex> lk(rdma_mtx_);
+            rdma_channels_.clear(); // Will trigger RdmaChannel destructors
+        }
+
+        // Step 5: Shutdown connections to unblock recv loops
         if (sock_ != -1) {
             shutdown(sock_, SHUT_RDWR);
             close(sock_);
             sock_ = -1;
         }
-        if (rdma_ep_) {
-            rdma_ep_->shutdown();
-        }
 
-        // Step 5: Wait for socket receiver thread (usually exits quickly after shutdown)
+        // Step 6: Wait for socket receiver thread (usually exits quickly after shutdown)
         try {
             if (receiver_thread_.joinable()) {
                 if (receiver_thread_.get_id() == std::this_thread::get_id()) {
@@ -99,19 +120,6 @@ public:
             if (receiver_thread_.joinable()) {
                 receiver_thread_.detach();
             }
-        }
-
-        // Step 6: RDMA receiver thread - detach instead of join
-        // RDMA's immRecv() may not respond to shutdown() properly, causing deadlock on join.
-        // Since we're in destructor and resources are already released, detach is safe.
-        // The OS will clean up when the process exits.
-        try {
-            if (rdma_receiver_thread_.joinable()) {
-                rdma_receiver_thread_.detach();
-            }
-        }
-        catch (...) {
-            // Ignore - we're exiting anyway
         }
     }
 
@@ -401,64 +409,71 @@ public:
         strncpy(meta.actor_id, id.c_str(), 31);
 
         // **Fast Path: RDMA Write with Imm**
-        if (rdma_ready_) {
-            size_t body_size  = PackedSize(req_data);
-            size_t total_size = 12 + body_size;
+        {
+            std::lock_guard<std::mutex> rdma_lk(rdma_mtx_);
+            if (rdma_channels_.count(id)) {
+                auto chan = rdma_channels_[id];
+                size_t body_size  = PackedSize(req_data);
+                size_t total_size = 12 + body_size;
 
-            // Realloc Remote if needed
-            if (total_size > remote_buf_size_) {
-                size_t new_size = total_size * 3 / 2;
+                // Realloc Remote if needed
+                if (total_size > chan->remote_buf_size) {
+                    size_t new_size = total_size * 3 / 2;
 
-                auto realloc_fut =
-                    callRemote<std::string, std::string>(id, Action::kRdmaRealloc, std::to_string(new_size));
-                std::string realloc_resp = realloc_fut.get();
+                    // Note: Need to release rdma_lk during recursive callRemote to avoid deadlock
+                    rdma_mtx_.unlock();
+                    auto realloc_fut =
+                        callRemote<std::string, std::string>(id, Action::kRdmaRealloc, std::to_string(new_size));
+                    std::string realloc_resp = realloc_fut.get();
+                    rdma_mtx_.lock();
 
-                if (realloc_resp.empty()) {
-                    std::cerr << "[Client] RDMA Realloc failed." << std::endl;
-                    // Fallback to slow path
-                    std::string body = Pack(req_data);
-                    sendRequest(meta, body);
-                    return fut;
+                    if (realloc_resp.empty()) {
+                        std::cerr << "[Client] RDMA Realloc failed." << std::endl;
+                        // Fallback to slow path
+                        std::string body = Pack(req_data);
+                        sendRequest(meta, body);
+                        return fut;
+                    }
+
+                    auto      json          = dlslime::json::parse(realloc_resp);
+                    uintptr_t new_addr      = json["buffer_addr"].get<uintptr_t>();
+                    size_t    reported_size = json["buffer_size"].get<size_t>();
+
+                    // Update Channel State
+                    chan->remote_addr     = new_addr;
+                    chan->remote_buf_size = reported_size;
+                    chan->ep->registerOrAccessRemoteMemoryRegion(new_addr, json["mr_info"][std::to_string(new_addr)]);
+
+                    std::cout << "[Client] Remote RDMA Buffer for " << id << " Expanded to " << (chan->remote_buf_size / 1024 / 1024) << "MB"
+                              << std::endl;
                 }
 
-                auto      json          = dlslime::json::parse(realloc_resp);
-                uintptr_t new_addr      = json["buffer_addr"].get<uintptr_t>();
-                size_t    reported_size = json["buffer_size"].get<size_t>();
+                // Realloc Local if needed
+                if (total_size > chan->local_buf_size) {
+                    if (chan->local_buf) delete[] chan->local_buf;
+                    chan->local_buf_size  = total_size * 3 / 2;
+                    chan->local_buf = new char[chan->local_buf_size];
+                    uintptr_t addr  = (uintptr_t)chan->local_buf;
+                    chan->ep->registerOrAccessMemoryRegion(addr, addr, 0, chan->local_buf_size);
+                }
 
-                // Update Client State
-                remote_addr_     = new_addr;
-                remote_buf_size_ = reported_size;
-                rdma_ep_->registerOrAccessRemoteMemoryRegion(new_addr, json["mr_info"][std::to_string(new_addr)]);
+                // Proceed with Write (Direct Serialize)
+                uint32_t* hdr_ptr = (uint32_t*)chan->local_buf;
+                hdr_ptr[0]        = static_cast<uint32_t>(act);
+                hdr_ptr[1]        = sid;
+                hdr_ptr[2]        = (uint32_t)body_size;
 
-                std::cout << "[Client] Remote RDMA Buffer Expanded to " << (remote_buf_size_ / 1024 / 1024) << "MB"
-                          << std::endl;
+                // DIRECT SERIALIZATION into pinned buffer!
+                PackTo(req_data, chan->local_buf + 12);
+
+                std::vector<dlslime::assign_tuple_t> chunks;
+                chunks.emplace_back((uintptr_t)chan->local_buf, (uintptr_t)chan->remote_addr, 0, 0, total_size);
+
+                auto write_fut = chan->ep->writeWithImm(chunks, sid, nullptr);
+                write_fut->wait();
+
+                return fut;
             }
-
-            // Realloc Local if needed
-            if (total_size > rdma_buf_size_) {
-                delete[] local_rdma_buf_;
-                rdma_buf_size_  = total_size * 3 / 2;
-                local_rdma_buf_ = new char[rdma_buf_size_];
-                uintptr_t addr  = (uintptr_t)local_rdma_buf_;
-                rdma_ep_->registerOrAccessMemoryRegion(addr, addr, 0, rdma_buf_size_);
-            }
-
-            // Proceed with Write (Direct Serialize)
-            uint32_t* hdr_ptr = (uint32_t*)local_rdma_buf_;
-            hdr_ptr[0]        = static_cast<uint32_t>(act);
-            hdr_ptr[1]        = sid;
-            hdr_ptr[2]        = (uint32_t)body_size;
-
-            // DIRECT SERIALIZATION into pinned buffer!
-            PackTo(req_data, local_rdma_buf_ + 12);
-
-            std::vector<dlslime::assign_tuple_t> chunks;
-            chunks.emplace_back((uintptr_t)local_rdma_buf_, (uintptr_t)remote_addr_, 0, 0, total_size);
-
-            auto write_fut = rdma_ep_->writeWithImm(chunks, sid, nullptr);
-            write_fut->wait();
-
-            return fut;
         }
 
         // Slow Path (Socket)
@@ -470,23 +485,28 @@ public:
     // Initialize RDMA channel with a specific actor
     bool initRDMA(const std::string& actor_id)
     {
-        if (rdma_ready_)
-            return true;
+        {
+            std::lock_guard<std::mutex> lk(rdma_mtx_);
+            if (rdma_channels_.count(actor_id))
+                return true;
+        }
 
         try {
-            // 1. Create Local EP (Default Constructor)
-            rdma_ep_ = std::make_shared<dlslime::RDMAEndpoint>();
+            auto chan = std::make_shared<RdmaChannel>();
 
-            // 2. Alloc and Register Local Buffer (4MB)
-            rdma_buf_size_       = 1 * 1024 * 1024;  // Test small buf
-            local_rdma_buf_      = new char[rdma_buf_size_];
-            uintptr_t local_addr = (uintptr_t)local_rdma_buf_;
-            rdma_ep_->registerOrAccessMemoryRegion(local_addr, local_addr, 0, rdma_buf_size_);
+            // 1. Create Local EP (Default Constructor)
+            chan->ep = std::make_shared<dlslime::RDMAEndpoint>();
+
+            // 2. Alloc and Register Local Buffer (1MB)
+            chan->local_buf_size  = 1 * 1024 * 1024;
+            chan->local_buf       = new char[chan->local_buf_size];
+            uintptr_t local_addr  = (uintptr_t)chan->local_buf;
+            chan->ep->registerOrAccessMemoryRegion(local_addr, local_addr, 0, chan->local_buf_size);
 
             // 3. Get Local Info
-            auto local_info            = rdma_ep_->endpointInfo();
+            auto local_info            = chan->ep->endpointInfo();
             local_info["buffer_addr"]  = local_addr;
-            local_info["buffer_size"]  = rdma_buf_size_;
+            local_info["buffer_size"]  = chan->local_buf_size;
             std::string local_info_str = local_info.dump();
 
             // 4. Handshake
@@ -501,36 +521,36 @@ public:
             auto remote_json = dlslime::json::parse(remote_info_str);
 
             // 6. Connect
-            rdma_ep_->connect(remote_json);
+            chan->ep->connect(remote_json);
 
             // 7. Store Remote Buffer Info
-            remote_addr_     = remote_json["buffer_addr"].get<uintptr_t>();
-            remote_buf_size_ = remote_json["buffer_size"].get<size_t>();
+            chan->remote_addr     = remote_json["buffer_addr"].get<uintptr_t>();
+            chan->remote_buf_size = remote_json["buffer_size"].get<size_t>();
 
-            rdma_ep_->registerOrAccessRemoteMemoryRegion(remote_addr_,
-                                                         remote_json["mr_info"][std::to_string(remote_addr_)]);
+            chan->ep->registerOrAccessRemoteMemoryRegion(chan->remote_addr,
+                                                         remote_json["mr_info"][std::to_string(chan->remote_addr)]);
 
-            rdma_ready_ = true;
-            std::cout << "[Client] RDMA Channel Established! Buffer: " << (rdma_buf_size_ / 1024 / 1024) << "MB"
-                      << std::endl;
+            // Start RDMA Receiver Thread for this channel
+            chan->receiver_thread = std::thread(&Client::rdmaRecvLoop, this, chan);
 
-            // Start RDMA Receiver Thread
-            rdma_receiver_thread_ = std::thread(&Client::rdmaRecvLoop, this);
+            {
+                std::lock_guard<std::mutex> lk(rdma_mtx_);
+                rdma_channels_[actor_id] = chan;
+            }
+
+            std::cout << "[Client] RDMA Channel Established for " << actor_id
+                      << "! Buffer: " << (chan->local_buf_size / 1024) << "KB" << std::endl;
 
             return true;
         }
         catch (const std::exception& e) {
-            std::cerr << "[Client] InitRDMA Exception: " << e.what() << std::endl;
+            std::cerr << "[Client] InitRDMA Exception for " << actor_id << ": " << e.what() << std::endl;
             return false;
         }
     }
 
-    std::shared_ptr<dlslime::RDMAEndpoint> rdma_ep_;
-    char*                                  local_rdma_buf_  = nullptr;
-    size_t                                 rdma_buf_size_   = 0;
-    uintptr_t                              remote_addr_     = 0;
-    size_t                                 remote_buf_size_ = 0;
-    bool                                   rdma_ready_      = false;
+    std::mutex                                          rdma_mtx_;
+    std::map<std::string, std::shared_ptr<RdmaChannel>> rdma_channels_;
 
 private:
     // Synchronous version of gangRelease for use in destructor
@@ -663,23 +683,23 @@ private:
         }
     }
 
-    void rdmaRecvLoop()
+    void rdmaRecvLoop(std::shared_ptr<RdmaChannel> chan)
     {
-        while (running_ && rdma_ready_) {
+        while (running_ && chan->running) {
             try {
-                auto fut = rdma_ep_->immRecv();
+                auto fut = chan->ep->immRecv();
                 fut->wait();
-                if (!running_)
+                if (!running_ || !chan->running)
                     break;
 
-                // Response is written to local_rdma_buf_ by Actor
-                uint32_t* ptr        = (uint32_t*)local_rdma_buf_;
+                // Response is written to local_buf by Actor
+                uint32_t* ptr        = (uint32_t*)chan->local_buf;
                 uint32_t  action_val = ptr[0];  // Action
                 uint32_t  seq_id     = ptr[1];  // Seq ID
                 uint32_t  data_size  = ptr[2];  // Body Size
 
                 // Zero Copy Body (offset 12)
-                std::string body(local_rdma_buf_ + 12, data_size);
+                std::string body(chan->local_buf + 12, data_size);
 
                 std::lock_guard<std::mutex> lk(map_mtx_);
                 if (response_handlers_.count(seq_id)) {
@@ -688,7 +708,7 @@ private:
                 }
             }
             catch (...) {
-                if (!running_)
+                if (!running_ || !chan->running)
                     break;
             }
         }
@@ -699,7 +719,6 @@ private:
     std::atomic<bool>                                           running_{false};
     std::mutex                                                  sock_mtx_, map_mtx_;
     std::thread                                                 receiver_thread_;
-    std::thread                                                 rdma_receiver_thread_;
     bool                                                        use_hub_;
     std::string                                                 hub_ip_;
     int                                                         hub_port_;

@@ -69,9 +69,11 @@ void handle_client(int client_fd, Agent* agent)
 
             // Check for V2 Spawn Body
             std::vector<int> gpu_ids;
+            std::string ticket_id = "";
             if (body.size() >= sizeof(SpawnActorReq)) {
                 // V2 Launch (with Resource Spec)
                 const auto* req = reinterpret_cast<const SpawnActorReq*>(body.data());
+                ticket_id = req->ticket_id;
                 for (int i=0; i<8; ++i) {
                     if (req->assigned_gpu_ids[i] >= 0) {
                         gpu_ids.push_back(req->assigned_gpu_ids[i]);
@@ -83,8 +85,9 @@ void handle_client(int client_fd, Agent* agent)
                 // Default: no GPU isolation
             }
 
-            agent->spawnActor(meta.actor_type, meta.actor_id, gpu_ids);
+            agent->spawnActor(meta.actor_type, meta.actor_id, gpu_ids, ticket_id);
             std::cout << "[Daemon] Spawned actor: " << meta.actor_id
+                      << " Ticket: " << (ticket_id.empty() ? "N/A" : ticket_id)
                       << " GPUs: " << gpu_ids.size() << std::endl;
 
             // Send Ack
@@ -131,14 +134,15 @@ int run_daemon(int argc, char** argv)
     std::string hub_ip   = "";
     int         hub_port = 8888;
     ResourceSpec capacity{0, 0};
+    std::string log_dir = ".spoke/logs";
 
     // Argument Parsing (Simple)
-    // Usage: ./agent <port> <hub_ip> <hub_port> [--gpus <n>]
+    // Usage: ./agent <port> <hub_ip> <hub_port> [--gpus <n>] [--log-dir <dir>]
     std::vector<std::string> args;
     for(int i=0; i<argc; ++i) args.push_back(argv[i]);
 
-    if (args.size() > 1) my_port = std::stoi(args[1]);
-    if (args.size() > 3) {
+    if (args.size() > 1 && args[1].rfind("--", 0) != 0) my_port = std::stoi(args[1]);
+    if (args.size() > 3 && args[2].rfind("--", 0) != 0 && args[3].rfind("--", 0) != 0) {
         hub_ip = args[2];
         hub_port = std::stoi(args[3]);
     }
@@ -148,9 +152,14 @@ int run_daemon(int argc, char** argv)
             capacity.num_gpus = std::stoi(args[i+1]);
             i++;
         }
+        else if (args[i] == "--log-dir" && i + 1 < args.size()) {
+            log_dir = args[i+1];
+            i++;
+        }
     }
 
     Agent local_agent;
+    local_agent.setLogDir(log_dir);
     int   server_fd = socket(AF_INET, SOCK_STREAM, 0);
     int   opt       = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));

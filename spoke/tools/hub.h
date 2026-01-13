@@ -202,6 +202,7 @@ public:
         // 3. Construct SpawnActorReq (The Payload for Agent)
         SpawnActorReq spawn_req;
         memset(&spawn_req, 0, sizeof(spawn_req));
+        strncpy(spawn_req.ticket_id, req.ticket_id, 63);
         spawn_req.resources = state.res_per_actor;
 
         // Fill assigned GPUs

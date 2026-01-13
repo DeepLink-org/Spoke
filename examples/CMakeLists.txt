@@ -38,9 +38,15 @@ target_link_libraries(smoke_v7_agent Spoke::daemon Spoke::core)
 add_executable(smoke_v7 smoke_v7.cpp)
 target_link_libraries(smoke_v7 Spoke::core)
 
+add_executable(smoke_v8_agent smoke_v8_agent.cpp)
+target_link_libraries(smoke_v8_agent Spoke::daemon Spoke::core)
+
+add_executable(smoke_v8 smoke_v8.cpp)
+target_link_libraries(smoke_v8 Spoke::core)
+
 # Installation
 install(TARGETS
-    smoke_v1 smoke_v2 smoke_v3 smoke_v4 smoke_v5 smoke_v6 smoke_v7
-    smoke_v2_agent smoke_v4_agent smoke_v5_agent smoke_v6_agent smoke_v7_agent
+    smoke_v1 smoke_v2 smoke_v3 smoke_v4 smoke_v5 smoke_v6 smoke_v7 smoke_v8
+    smoke_v2_agent smoke_v4_agent smoke_v5_agent smoke_v6_agent smoke_v7_agent smoke_v8_agent
     DESTINATION examples
 )

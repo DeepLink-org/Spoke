@@ -15,7 +15,7 @@ target_include_directories(spoke PUBLIC
 # Direct Link to Internal Target (dlslime::dlslime)
 # The add_subdirectory above makes this target available
 message(STATUS "Spoke: Linking internal DLSlime")
-target_link_libraries(spoke PUBLIC dlslime::dlslime)
+target_link_libraries(spoke PUBLIC dlslime::dlslime pthread)
 target_compile_definitions(spoke PUBLIC SPOKE_HAS_RDMA)
 
 install(TARGETS spoke
