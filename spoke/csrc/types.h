@@ -15,6 +15,7 @@ enum class Action : uint32_t {
     kNetAllocate     = 0x32,  // [New] V2 Allocation
     kNetLaunch       = 0x33,  // [New] V2 Launch
     kNetRelease      = 0x34,  // [New] V2 Release
+    kStreamPush      = 0x40,  // [New] Unsolicited Stream Message (Server -> Client)
     kUserActionStart = 0x10
 };
 
@@ -37,6 +38,7 @@ struct NetMeta {
 struct NetRespMeta {
     uint32_t seq_id;
     int      status;
+    Action   action; // [New] Added action field for async push
 };
 
 // IPC 管道消息头
@@ -70,6 +72,7 @@ struct AllocateReq {
     uint32_t actors_per_node;  // Actors per node (Total actors = num_nodes * actors_per_node)
     ResourceSpec res_per_actor;// Resource requirement per actor
     bool strict_pack = true;   // Require exact packing (true for typical TP/PP)
+    char master_node_ip[64];   // [New] Affinity: Prefer this node if available
 };
 
 // Detail for a single allocated slot

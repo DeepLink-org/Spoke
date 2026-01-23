@@ -112,9 +112,36 @@ public:
         // 1. Find 'num_nodes' that satisfy 'actors_per_node' * 'res_per_actor'
         std::vector<NodeInfo*> candidate_nodes;
 
-        // Simple greedy: Find first N nodes that fit
-        // (In production, use smarter bin-packing)
+        // Affinity Logic: If master_node_ip is set, try to find it first.
+        std::string master_ip = req.master_node_ip;
+        if (!master_ip.empty()) {
+            for (auto& node : nodes_) {
+                if (node.ip == master_ip) {
+                    int free_gpus = node.total.num_gpus - node.used.num_gpus;
+                    int req_gpus = req.actors_per_node * req.res_per_actor.num_gpus;
+                    if (free_gpus >= req_gpus) {
+                        candidate_nodes.push_back(&node);
+                        std::cout << "[Hub] Affinity match found: " << master_ip << std::endl;
+                    } else {
+                        std::cout << "[Hub] Affinity node " << master_ip << " has insufficient resources." << std::endl;
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Simple greedy: Find remaining nodes that fit
         for (auto& node : nodes_) {
+            // Skip if already added (affinity node)
+            bool already_added = false;
+            for (auto* c : candidate_nodes) {
+                if (c->ip == node.ip && c->port == node.port) {
+                    already_added = true;
+                    break;
+                }
+            }
+            if (already_added) continue;
+
             int free_gpus = node.total.num_gpus - node.used.num_gpus;
             int req_gpus = req.actors_per_node * req.res_per_actor.num_gpus;
 
@@ -148,7 +175,11 @@ public:
                 // Assign specific GPU ID (Simple linear allocation from current usage)
                 // Assuming used_gpus are [0, 1, ..., used-1], we assign [used, used+1, ...]
                 // IMPORTANT: This assumes simple fragmentation. Real GPU allocator needs bitmap.
-                slot.gpu_id = node->used.num_gpus + (i * req.res_per_actor.num_gpus);
+                if (req.res_per_actor.num_gpus > 0) {
+                    slot.gpu_id = node->used.num_gpus + (i * req.res_per_actor.num_gpus);
+                } else {
+                    slot.gpu_id = -1; // No GPU assigned
+                }
                 // Note: Only supporting contiguous 1-GPU allocation for now.
 
                 out_slots.push_back(slot);
@@ -214,7 +245,10 @@ public:
         // Fill assigned GPUs
         // TODO: Support assigning multiple GPUs if res_per_actor > 1
         for(int i=0; i<8; ++i) spawn_req.assigned_gpu_ids[i] = -1;
-        spawn_req.assigned_gpu_ids[0] = slot.gpu_id;
+
+        if (state.res_per_actor.num_gpus > 0) {
+            spawn_req.assigned_gpu_ids[0] = slot.gpu_id;
+        }
 
         // Concatenate SpawnReq + Args
         std::vector<char> payload(sizeof(SpawnActorReq) + args_body.size());

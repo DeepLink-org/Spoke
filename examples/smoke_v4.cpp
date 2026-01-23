@@ -20,7 +20,7 @@ const spoke::Action kUpdatePhysics = (spoke::Action)0x50;
 int main()
 {
     std::cout << "[V4] Connecting..." << std::endl;
-    spoke::Client client("127.0.0.1", 9000);
+    spoke::Client client("127.0.0.1", 8888);
 
     std::cout << "[V4] Spawning PhysicsActor..." << std::endl;
     client.spawnRemote("PhysicsActor", "phys_1");

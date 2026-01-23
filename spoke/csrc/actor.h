@@ -40,7 +40,14 @@ using MethodHandler = std::function<std::string(MessageView)>;
 
 class Actor {
 public:
-    Actor(const std::string& id, int rx, int tx): actor_id_(id), rx_fd_(rx), tx_fd_(tx) {}
+    Actor(const std::string& id, int rx, int tx): actor_id_(id), rx_fd_(rx), tx_fd_(tx) {
+        int el = 0;
+        if(const char* e = std::getenv("NANODEPLOY_ENGINE_LOG_LEVEL")) el = std::atoi(e);
+        int rl = 0;
+        if(const char* r = std::getenv("NANODEPLOY_RUNNER_LOG_LEVEL")) rl = std::atoi(r);
+        // Enable debug logs if either level is >= 2 (DEBUG)
+        debug_mode_ = (el >= 2 || rl >= 2);
+    }
 
     virtual ~Actor()
     {
@@ -74,6 +81,60 @@ public:
                 onMessage(hdr, body);
             }
         }
+    }
+
+    // [New] Push unsolicited message to Client (Stream)
+    // Uses RDMA if available, else Socket
+    bool pushToClient(uint32_t slot_id, const std::string& data)
+    {
+        // 1. Try RDMA
+        if (rdma_ep_ && client_remote_addr_ > 0) {
+             try {
+                size_t total_size = 12 + data.size();
+                if (total_size > rdma_buf_size_) {
+                     std::cerr << "[Actor] Push RDMA buffer too small!" << std::endl;
+                     // TODO: Realloc? But realloc needs Client cooperation (RPC).
+                     // Push should be fast. Fallback to socket?
+                     goto push_socket;
+                }
+
+                uint32_t* resp_ptr = (uint32_t*)rdma_buffer_;
+                resp_ptr[0]        = static_cast<uint32_t>(Action::kStreamPush);
+                resp_ptr[1]        = slot_id;
+                resp_ptr[2]        = (uint32_t)data.size();
+
+                if (!data.empty()) {
+                    memcpy(rdma_buffer_ + 12, data.data(), data.size());
+                }
+
+                std::vector<dlslime::assign_tuple_t> chunks;
+                chunks.emplace_back((uintptr_t)rdma_buffer_, client_remote_addr_, 0, 0, total_size);
+
+                auto write_fut = rdma_ep_->writeWithImm(chunks, slot_id, nullptr); // imm_data=slot_id? or dummy?
+                // Note: writeWithImm(..., imm_data) -> imm_data is usually 32-bit.
+                // Client side immRecv doesn't return imm_data in future?
+                // DLSlime immRecv() returns Future. wait() returns void.
+                // But DLSlime RDMAEndpoint usually doesn't expose the Imm data value to user easily in current API?
+                // Wait, in Client::rdmaRecvLoop we read from buffer. The Imm is just a signal.
+                // The data is in the buffer.
+
+                write_fut->wait();
+                return true;
+             } catch (...) {
+                 // Fallback
+             }
+        }
+
+    push_socket:
+        // 2. Fallback to Socket
+        // Response header: Action=kStreamPush, Seq=slot_id
+        PipeHeader resp_hdr{Action::kStreamPush, slot_id, (uint32_t)data.size()};
+        std::lock_guard<std::mutex> lk(actor_mtx_); // Reuse actor mutex for tx_fd_ safety?
+        if (write(tx_fd_, &resp_hdr, sizeof(PipeHeader)) < 0) return false;
+        if (!data.empty()) {
+            if (write(tx_fd_, data.data(), data.size()) < 0) return false;
+        }
+        return true;
     }
 
 protected:
@@ -123,6 +184,7 @@ private:
         }
 
         if (hdr.action == Action::kInitRDMA) {
+            if (debug_mode_) std::cout << "[Actor] Received kInitRDMA for Seq: " << hdr.seq_id << std::endl;
             std::string res = setupRDMA(body);
             PipeHeader  resp_hdr{Action::kInit, hdr.seq_id, (uint32_t)res.size()};
             if (write(tx_fd_, &resp_hdr, sizeof(PipeHeader)) < 0) {
@@ -133,12 +195,13 @@ private:
                     std::cerr << "[Actor] Failed to write response body" << std::endl;
                 }
             }
+            if (debug_mode_) std::cout << "[Actor] kInitRDMA response written for Seq: " << hdr.seq_id << std::endl;
             return;
         }
 
         // Use unified processing
         std::string res = processRequest(hdr, MessageView(body));
-        std::cout << "[Actor] Processed request. Result size: " << res.size() << ". Writing response..." << std::endl;
+        if (debug_mode_) std::cout << "[Actor] Processed request. Result size: " << res.size() << ". Writing response..." << std::endl;
 
         PipeHeader resp_hdr{Action::kInit, hdr.seq_id, (uint32_t)res.size()};
         if (write(tx_fd_, &resp_hdr, sizeof(PipeHeader)) < 0) {
@@ -149,7 +212,7 @@ private:
                 std::cerr << "[Actor] Failed to write response body" << std::endl;
             }
         }
-        std::cout << "[Actor] Response written to FD " << tx_fd_ << std::endl;
+        if (debug_mode_) std::cout << "[Actor] Response written to FD " << tx_fd_ << std::endl;
     }
 
     std::string setupRDMA(const std::string& remote_info_str)
@@ -196,8 +259,10 @@ private:
 
     void rdmaPollLoop()
     {
+        std::cout << "[Actor] RDMA Poll Loop Started. EP: " << rdma_ep_.get() << std::endl;
         while (is_active_) {
             try {
+                // std::cout << "[Actor] Waiting for RDMA Imm..." << std::endl;
                 auto fut = rdma_ep_->immRecv();
                 fut->wait();
                 if (!is_active_)
@@ -208,6 +273,10 @@ private:
                 hdr.action    = static_cast<Action>(ptr[0]);
                 hdr.seq_id    = ptr[1];
                 hdr.data_size = ptr[2];
+
+
+
+                if (debug_mode_) std::cout << "⚡ [Actor] RDMA Request: Action=" << ptr[0] << ", Seq=" << hdr.seq_id << std::endl;
 
                 MessageView body(rdma_buffer_ + 12, hdr.data_size);
 
@@ -249,11 +318,22 @@ private:
                 auto write_fut = rdma_ep_->writeWithImm(chunks, hdr.seq_id, nullptr);
                 write_fut->wait();
             }
+            catch (const std::exception& e) {
+                if (is_active_) {
+                    std::cerr << "[Actor] RDMA Poll Loop Exception: " << e.what() << std::endl;
+                }
+                if (!is_active_)
+                    break;
+            }
             catch (...) {
+                if (is_active_) {
+                    std::cerr << "[Actor] RDMA Poll Loop Unknown Exception" << std::endl;
+                }
                 if (!is_active_)
                     break;
             }
         }
+        std::cout << "[Actor] RDMA Poll Loop Exiting" << std::endl;
     }
 
     std::string actor_id_;
@@ -270,7 +350,9 @@ private:
 
     std::thread                               rdma_thread_;
     std::mutex                                actor_mtx_;
+
     std::unordered_map<Action, MethodHandler> handlers_;
+    bool                                      debug_mode_ = false;
 };
 
 using ActorFactoryFunc = std::function<std::unique_ptr<Actor>(std::string, int, int)>;
@@ -291,6 +373,15 @@ public:
         if (creators_.count(type))
             return creators_[type](id, rx, tx);
         return nullptr;
+    }
+
+    std::vector<std::string> getRegisteredTypes() const
+    {
+        std::vector<std::string> types;
+        for (const auto& [type, _] : creators_) {
+            types.push_back(type);
+        }
+        return types;
     }
 
 private:

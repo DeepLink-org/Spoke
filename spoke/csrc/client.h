@@ -43,89 +43,72 @@ struct RdmaChannel {
 
 class Client {
 public:
-    Client(const std::string& ip, int port): target_ip_(ip), target_port_(port), use_hub_(false)
+    Client(const std::string& ip, int port): use_hub_(false)
     {
+        running_ = true;
+        hub_ip_ = ip;
+        hub_port_ = port;
         connectToDaemon(ip, port);
     }
 
     Client(const std::string& ip, int port, bool is_hub_mode):
         use_hub_(is_hub_mode)
     {
-        if (is_hub_mode) {
-            hub_ip_ = ip;
-            hub_port_ = port;
-            // In Hub mode, we don't connect to a daemon until spawnRemote or gangAllocate is called
-        } else {
-            target_ip_ = ip;
-            target_port_ = port;
+        running_ = true;
+        hub_ip_ = ip;
+        hub_port_ = port;
+        if (!is_hub_mode) {
             connectToDaemon(ip, port);
         }
     }
 
     ~Client()
     {
-        // Step 1: Collect tickets to release (minimize lock holding time)
+        // Step 1: Auto-release any unreleased tickets (safety net)
         std::vector<std::string> tickets_to_release;
         {
             std::lock_guard<std::mutex> lk(ticket_mtx_);
             tickets_to_release.assign(allocated_tickets_.begin(), allocated_tickets_.end());
             allocated_tickets_.clear();
         }
-
-        // Step 2: Release gang allocations BEFORE stopping threads (needs network)
         for (const auto& ticket : tickets_to_release) {
             std::cerr << "[Client] Auto-releasing unreleased ticket: " << ticket << std::endl;
             try {
                 gangReleaseSync(ticket);
-            }
-            catch (const std::exception& e) {
-                std::cerr << "[Client] Failed to auto-release ticket " << ticket << ": " << e.what() << std::endl;
+            } catch (...) {
+                // Ignore errors during cleanup
             }
         }
 
-        // Step 3: Signal threads to stop
+        // Step 2: Signal threads to stop
         running_ = false;
 
-        // Step 4: Shutdown RDMA channels
+        // Step 3: Shutdown RDMA channels
         {
             std::lock_guard<std::mutex> lk(rdma_mtx_);
-            rdma_channels_.clear(); // Will trigger RdmaChannel destructors
+            rdma_channels_.clear();
         }
 
-        // Step 5: Shutdown connections to unblock recv loops
-        if (sock_ != -1) {
-            shutdown(sock_, SHUT_RDWR);
-            close(sock_);
-            sock_ = -1;
+        // Step 4: Close all daemon connections
+        {
+            std::lock_guard<std::mutex> lk(sock_mtx_);
+            for (auto& [addr, s] : agent_socks_) {
+                shutdown(s, SHUT_RDWR);
+                close(s);
+            }
+            agent_socks_.clear();
         }
 
-        // Step 6: Wait for socket receiver thread (usually exits quickly after shutdown)
-        try {
-            if (receiver_thread_.joinable()) {
-                if (receiver_thread_.get_id() == std::this_thread::get_id()) {
-                    receiver_thread_.detach();
-                }
-                else {
-                    receiver_thread_.join();
-                }
-            }
-        }
-        catch (const std::exception& e) {
-            std::cerr << "[Client] Exception joining receiver_thread: " << e.what() << std::endl;
-            if (receiver_thread_.joinable()) {
-                receiver_thread_.detach();
-            }
-        }
-        catch (...) {
-            if (receiver_thread_.joinable()) {
-                receiver_thread_.detach();
-            }
+        // Step 5: Detach receiver threads
+        for (auto& t : receiver_threads_) {
+            if (t.joinable()) t.detach();
         }
     }
 
     // [New] V2 Allocation API
     std::future<AllocateResp> gangAllocate(uint32_t num_nodes, uint32_t actors_per_node,
-                                                const ResourceSpec& res_per_actor, bool strict_pack = true)
+                                                const ResourceSpec& res_per_actor, bool strict_pack = true,
+                                                const std::string& master_node_ip = "")
     {
         auto prom = std::make_shared<std::promise<AllocateResp>>();
         auto fut  = prom->get_future();
@@ -155,6 +138,7 @@ public:
         req.actors_per_node = actors_per_node;
         req.res_per_actor = res_per_actor;
         req.strict_pack = strict_pack;
+        strncpy(req.master_node_ip, master_node_ip.c_str(), 63);
 
         NetMeta   meta{Action::kNetAllocate, seq_++, "", ""};
         NetHeader hdr{0x504F4B45, sizeof(NetMeta), sizeof(AllocateReq)};
@@ -191,28 +175,17 @@ public:
         AllocateResp resp;
         memcpy(&resp, body.data(), sizeof(AllocateResp));
 
-        // Track ticket for auto-release on destruction
+        // Track ticket and slots
+        std::vector<AllocatedSlot> slots;
+        if (resp.num_members > 0) {
+            slots.resize(resp.num_members);
+            memcpy(slots.data(), body.data() + sizeof(AllocateResp), resp.num_members * sizeof(AllocatedSlot));
+        }
+
         {
             std::lock_guard<std::mutex> lk(ticket_mtx_);
             allocated_tickets_.insert(std::string(resp.ticket_id));
-        }
-
-        // [Auto-Connect] Connect to the first node in the allocation
-        // This is necessary because Client (currently) maintains a single connection for callRemote
-        if (resp.num_members > 0) {
-            size_t slots_offset = sizeof(AllocateResp);
-            size_t expected_size = slots_offset + resp.num_members * sizeof(AllocatedSlot);
-
-            if (body.size() >= expected_size) {
-                const AllocatedSlot* slots = reinterpret_cast<const AllocatedSlot*>(body.data() + slots_offset);
-                // Only connect if not already connected
-                if (sock_ == -1) {
-                    std::string node_ip = slots[0].node_ip;
-                    int node_port = slots[0].node_port;
-                    std::cout << "[Client] Auto-connecting to allocated node: " << node_ip << ":" << node_port << std::endl;
-                    connectToDaemon(node_ip, node_port);
-                }
-            }
+            ticket_to_slots_[resp.ticket_id] = slots;
         }
 
         prom->set_value(resp);
@@ -225,6 +198,23 @@ public:
     {
         auto prom = std::make_shared<std::promise<bool>>();
         auto fut  = prom->get_future();
+
+        // Map global rank to slot and actor_id
+        AllocatedSlot slot;
+        {
+            std::lock_guard<std::mutex> lk(ticket_mtx_);
+            if (ticket_to_slots_.count(ticket_id) && global_rank < ticket_to_slots_[ticket_id].size()) {
+                slot = ticket_to_slots_[ticket_id][global_rank];
+                actor_to_addr_[id] = std::string(slot.node_ip) + ":" + std::to_string(slot.node_port);
+            } else {
+                try { throw std::runtime_error("Invalid ticket or rank during launch"); }
+                catch(...) { prom->set_exception(std::current_exception()); }
+                return fut;
+            }
+        }
+
+        // Connect to the Agent if not already connected
+        connectToDaemon(slot.node_ip, slot.node_port);
 
         if (!use_hub_) {
             try { throw std::runtime_error("launchActor requires Hub mode"); }
@@ -297,9 +287,13 @@ public:
             int  port = 0;
             sscanf(node_addr.c_str(), "%[^:]:%d", ip_buf, &port);
             connectToDaemon(ip_buf, port);
+
+            // Record this mapping for subsequent calls
+            {
+                std::lock_guard<std::mutex> lk(ticket_mtx_);
+                actor_to_addr_[id] = std::string(ip_buf) + ":" + std::to_string(port);
+            }
         }
-        if (sock_ == -1)
-            return;
 
         auto     prom = std::make_shared<std::promise<bool>>();
         auto     fut  = prom->get_future();
@@ -312,21 +306,38 @@ public:
         NetMeta meta{Action::kNetSpawn, sid, "", ""};
         strncpy(meta.actor_id, id.c_str(), 31);
         strncpy(meta.actor_type, type.c_str(), 31);
-        sendRequest(meta, "");
+
+        if (!sendRequest(id, meta, "")) {
+             std::cerr << "[Client] Failed to send spawn request for: " << id << std::endl;
+             return;
+        }
 
         // Wait for Ack
         fut.wait();
     }
 
+    // [New] Register a mailbox for unsolicited messages
+    // Returns a Mailbox ID (slot ID)
+    using StreamHandler = std::function<void(const std::string&)>;
+    void registerMailbox(uint32_t slot_id, StreamHandler handler)
+    {
+        std::lock_guard<std::mutex> lk(map_mtx_);
+        mailbox_handlers_[slot_id] = handler;
+    }
+
+    void unregisterMailbox(uint32_t slot_id)
+    {
+        std::lock_guard<std::mutex> lk(map_mtx_);
+        mailbox_handlers_.erase(slot_id);
+    }
+
     // [New] Stop remote actor (Fire-and-Forget)
     void stopRemote(const std::string& id)
     {
-        if (sock_ == -1)
-            return;
         uint32_t sid = seq_++;
         NetMeta  meta{Action::kStop, sid, "", ""};
         strncpy(meta.actor_id, id.c_str(), 31);
-        sendRequest(meta, "");
+        sendRequest(id, meta, "");
     }
 
     // [New] Release allocated resources (Gang Release)
@@ -380,106 +391,101 @@ public:
         return fut;
     }
 
-    // [关键更新] 泛型调用，使用 Pack/Unpack
-    template<typename ReqT, typename RespT>
-    std::future<RespT> callRemote(const std::string& id, Action act, const ReqT& req_data)
+    // [New] Raw interface (Socket only, no RDMA)
+    std::future<std::string> callRemoteRaw(const std::string& id, Action act, const std::string& body)
     {
-        auto prom = std::make_shared<std::promise<RespT>>();
+        auto prom = std::make_shared<std::promise<std::string>>();
         auto fut  = prom->get_future();
-        if (sock_ == -1) {
-            try {
-                throw std::runtime_error("[Client] Not connected");
-            }
-            catch (...) {
-                prom->set_exception(std::current_exception());
-            }
-            return fut;
-        }
 
         uint32_t sid = seq_++;
         {
             std::lock_guard<std::mutex> lk(map_mtx_);
             response_handlers_[sid] = [prom](const std::string& raw) {
-                // 回调时自动反序列化
-                prom->set_value(Unpack<RespT>(raw));
+                prom->set_value(raw);
             };
         }
 
         NetMeta meta{act, sid, "", ""};
         strncpy(meta.actor_id, id.c_str(), 31);
 
+        if (!sendRequest(id, meta, body)) {
+            try { throw std::runtime_error("[Client] Failed to send socket request to actor: " + id); }
+            catch(...) { prom->set_exception(std::current_exception()); }
+        }
+        return fut;
+    }
+
+    // [关键更新] 泛型调用，使用 Pack/Unpack
+    template<typename ReqT, typename RespT>
+    std::future<RespT> callRemote(const std::string& id, Action act, const ReqT& req_data)
+    {
         // **Fast Path: RDMA Write with Imm**
+        if (false) // FORCE DISABLE RDMA
         {
             std::lock_guard<std::mutex> rdma_lk(rdma_mtx_);
             if (rdma_channels_.count(id)) {
+                auto prom = std::make_shared<std::promise<RespT>>();
+                auto fut  = prom->get_future();
+                uint32_t sid = seq_++;
+                {
+                    std::lock_guard<std::mutex> lk(map_mtx_);
+                    response_handlers_[sid] = [prom](const std::string& raw) {
+                        prom->set_value(Unpack<RespT>(raw));
+                    };
+                }
+
                 auto chan = rdma_channels_[id];
+                std::cout << "⚡ [Client] RDMA Fast Path: Actor=" << id << ", Action=" << static_cast<int>(act) << ", Seq=" << sid << std::endl;
+
                 size_t body_size  = PackedSize(req_data);
                 size_t total_size = 12 + body_size;
 
-                // Realloc Remote if needed
                 if (total_size > chan->remote_buf_size) {
                     size_t new_size = total_size * 3 / 2;
-
-                    // Note: Need to release rdma_lk during recursive callRemote to avoid deadlock
                     rdma_mtx_.unlock();
                     auto realloc_fut =
                         callRemote<std::string, std::string>(id, Action::kRdmaRealloc, std::to_string(new_size));
                     std::string realloc_resp = realloc_fut.get();
                     rdma_mtx_.lock();
-
                     if (realloc_resp.empty()) {
-                        std::cerr << "[Client] RDMA Realloc failed." << std::endl;
-                        // Fallback to slow path
-                        std::string body = Pack(req_data);
-                        sendRequest(meta, body);
-                        return fut;
+                        // Fallback to socket if realloc fails
+                        goto slow_path;
                     }
-
-                    auto      json          = dlslime::json::parse(realloc_resp);
-                    uintptr_t new_addr      = json["buffer_addr"].get<uintptr_t>();
-                    size_t    reported_size = json["buffer_size"].get<size_t>();
-
-                    // Update Channel State
-                    chan->remote_addr     = new_addr;
-                    chan->remote_buf_size = reported_size;
-                    chan->ep->registerOrAccessRemoteMemoryRegion(new_addr, json["mr_info"][std::to_string(new_addr)]);
-
-                    std::cout << "[Client] Remote RDMA Buffer for " << id << " Expanded to " << (chan->remote_buf_size / 1024 / 1024) << "MB"
-                              << std::endl;
+                    auto json = dlslime::json::parse(realloc_resp);
+                    chan->remote_addr = json["buffer_addr"].get<uintptr_t>();
+                    chan->remote_buf_size = json["buffer_size"].get<size_t>();
+                    chan->ep->registerOrAccessRemoteMemoryRegion(chan->remote_addr, json["mr_info"][std::to_string(chan->remote_addr)]);
                 }
 
-                // Realloc Local if needed
                 if (total_size > chan->local_buf_size) {
                     if (chan->local_buf) delete[] chan->local_buf;
-                    chan->local_buf_size  = total_size * 3 / 2;
+                    chan->local_buf_size = total_size * 3 / 2;
                     chan->local_buf = new char[chan->local_buf_size];
-                    uintptr_t addr  = (uintptr_t)chan->local_buf;
+                    uintptr_t addr = (uintptr_t)chan->local_buf;
                     chan->ep->registerOrAccessMemoryRegion(addr, addr, 0, chan->local_buf_size);
                 }
 
-                // Proceed with Write (Direct Serialize)
                 uint32_t* hdr_ptr = (uint32_t*)chan->local_buf;
-                hdr_ptr[0]        = static_cast<uint32_t>(act);
-                hdr_ptr[1]        = sid;
-                hdr_ptr[2]        = (uint32_t)body_size;
-
-                // DIRECT SERIALIZATION into pinned buffer!
+                hdr_ptr[0] = static_cast<uint32_t>(act);
+                hdr_ptr[1] = sid;
+                hdr_ptr[2] = (uint32_t)body_size;
                 PackTo(req_data, chan->local_buf + 12);
-
                 std::vector<dlslime::assign_tuple_t> chunks;
                 chunks.emplace_back((uintptr_t)chan->local_buf, (uintptr_t)chan->remote_addr, 0, 0, total_size);
-
                 auto write_fut = chan->ep->writeWithImm(chunks, sid, nullptr);
                 write_fut->wait();
-
+                std::cout << "⚡ [Client] RDMA Write Completed for Seq: " << sid << std::endl;
                 return fut;
             }
         }
 
-        // Slow Path (Socket)
-        std::string body = Pack(req_data);
-        sendRequest(meta, body);
-        return fut;
+    slow_path:
+        // Slow Path (Socket) - Now calling callRemoteRaw to avoid duplication
+        std::string req_raw = Pack(req_data);
+        return std::async(std::launch::async, [this, id, act, req_raw]() {
+            auto fut = this->callRemoteRaw(id, act, req_raw);
+            return Unpack<RespT>(fut.get());
+        });
     }
 
     // Initialize RDMA channel with a specific actor
@@ -509,8 +515,15 @@ public:
             local_info["buffer_size"]  = chan->local_buf_size;
             std::string local_info_str = local_info.dump();
 
-            // 4. Handshake
-            auto        fut = callRemote<std::string, std::string>(actor_id, Action::kInitRDMA, local_info_str);
+            // 4. Handshake (Must use standard callRemote to get to the Actor)
+            // Use a specific internal action to ensure it's handled by Actor's base class
+            auto fut = callRemote<std::string, std::string>(actor_id, Action::kInitRDMA, local_info_str);
+
+            // Set a timeout for the handshake to avoid permanent hang
+            if (fut.wait_for(std::chrono::seconds(5)) == std::future_status::timeout) {
+                std::cerr << "[Client] RDMA Handshake Timeout for " << actor_id << std::endl;
+                return false;
+            }
             std::string remote_info_str = fut.get();
 
             if (remote_info_str.empty()) {
@@ -553,6 +566,35 @@ public:
     std::map<std::string, std::shared_ptr<RdmaChannel>> rdma_channels_;
 
 private:
+    std::string queryHubForNode()
+    {
+        int                hs = socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in sa;
+        sa.sin_family = AF_INET;
+        sa.sin_port   = htons(hub_port_);
+        inet_pton(AF_INET, hub_ip_.c_str(), &sa.sin_addr);
+        if (connect(hs, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
+            close(hs);
+            return "";
+        }
+
+        NetMeta   meta{Action::kHubFindNode, 999, "", ""};
+        NetHeader hdr{0x504F4B45, sizeof(NetMeta), 0};
+        send(hs, &hdr, sizeof(hdr), 0);
+        send(hs, &meta, sizeof(meta), 0);
+
+        NetHeader rh;
+        recv(hs, &rh, sizeof(rh), MSG_WAITALL);
+        NetRespMeta rm;
+        recv(hs, &rm, sizeof(rm), MSG_WAITALL);
+        std::string body;
+        body.resize(rh.data_size);
+        if (rh.data_size > 0)
+            recv(hs, body.data(), rh.data_size, MSG_WAITALL);
+        close(hs);
+        return body;
+    }
+
     // Synchronous version of gangRelease for use in destructor
     // Note: Does NOT modify allocated_tickets_ (caller handles it)
     void gangReleaseSync(const std::string& ticket_id)
@@ -595,89 +637,93 @@ private:
 
     void connectToDaemon(const std::string& ip, int port)
     {
-        if (sock_ != -1) {
-            running_ = false;
-            shutdown(sock_, SHUT_RDWR);
-            close(sock_);
-            if (receiver_thread_.joinable())
-                receiver_thread_.join();
+        std::string addr_str = ip + ":" + std::to_string(port);
+        {
+            std::lock_guard<std::mutex> lk(sock_mtx_);
+            if (agent_socks_.count(addr_str)) return;
         }
 
-        sock_ = socket(AF_INET, SOCK_STREAM, 0);
+        int s = socket(AF_INET, SOCK_STREAM, 0);
         struct sockaddr_in sa;
         sa.sin_family = AF_INET;
         sa.sin_port   = htons(port);
         inet_pton(AF_INET, ip.c_str(), &sa.sin_addr);
-        if (connect(sock_, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
-            std::cerr << "[Client] Connect failed " << ip << ":" << port << std::endl;
-            sock_ = -1;
+        if (connect(s, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
+            std::cerr << "[Client] Connect failed to Agent at " << addr_str << std::endl;
+            close(s);
             return;
         }
-        running_         = true;
-        receiver_thread_ = std::thread(&Client::receiveLoop, this);
-    }
 
-    std::string queryHubForNode()
-    {
-        int                hs = socket(AF_INET, SOCK_STREAM, 0);
-        struct sockaddr_in sa;
-        sa.sin_family = AF_INET;
-        sa.sin_port   = htons(hub_port_);
-        inet_pton(AF_INET, hub_ip_.c_str(), &sa.sin_addr);
-        if (connect(hs, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
-            close(hs);
-            return "";
+        {
+            std::lock_guard<std::mutex> lk(sock_mtx_);
+            agent_socks_[addr_str] = s;
         }
 
-        NetMeta   meta{Action::kHubFindNode, 999, "", ""};
-        NetHeader hdr{0x504F4B45, sizeof(NetMeta), 0};
-        send(hs, &hdr, sizeof(hdr), 0);
-        send(hs, &meta, sizeof(meta), 0);
-
-        NetHeader rh;
-        recv(hs, &rh, sizeof(rh), MSG_WAITALL);
-        NetRespMeta rm;
-        recv(hs, &rm, sizeof(rm), MSG_WAITALL);
-        std::string body;
-        body.resize(rh.data_size);
-        if (rh.data_size > 0)
-            recv(hs, body.data(), rh.data_size, MSG_WAITALL);
-        close(hs);
-        return body;
+        // Start a dedicated receiver thread for this connection
+        receiver_threads_.emplace_back(&Client::receiveLoop, this, s);
     }
 
-    void sendRequest(const NetMeta& meta, const std::string& body)
+    bool sendRequest(const std::string& actor_id, const NetMeta& meta, const std::string& body)
     {
-        NetHeader                   hdr{0x504F4B45, sizeof(NetMeta), (uint32_t)body.size()};
-        std::lock_guard<std::mutex> lk(sock_mtx_);
-        send(sock_, &hdr, sizeof(hdr), 0);
-        send(sock_, &meta, sizeof(meta), 0);
-        if (!body.empty())
-            send(sock_, body.data(), body.size(), 0);
+        std::string addr;
+        {
+            std::lock_guard<std::mutex> lk(ticket_mtx_);
+            if (actor_to_addr_.count(actor_id)) {
+                addr = actor_to_addr_[actor_id];
+            } else {
+                // Fallback: Use the first available agent if actor mapping unknown
+                std::lock_guard<std::mutex> slk(sock_mtx_);
+                if (!agent_socks_.empty()) addr = agent_socks_.begin()->first;
+            }
+        }
+
+        if (addr.empty()) return false;
+
+        int s = -1;
+        {
+            std::lock_guard<std::mutex> lk(sock_mtx_);
+            if (agent_socks_.count(addr)) s = agent_socks_[addr];
+        }
+
+        if (s == -1) return false;
+
+        NetHeader hdr{0x504F4B45, sizeof(NetMeta), (uint32_t)body.size()};
+        std::lock_guard<std::mutex> lk(send_mtx_); // Serialize sends on sockets
+        if (send(s, &hdr, sizeof(hdr), 0) < 0) return false;
+        if (send(s, &meta, sizeof(meta), 0) < 0) return false;
+        if (!body.empty()) {
+            if (send(s, body.data(), body.size(), 0) < 0) return false;
+        }
+        return true;
     }
 
-    void receiveLoop()
+    void receiveLoop(int s)
     {
         while (running_) {
             NetHeader hdr;
-            if (recv(sock_, &hdr, sizeof(hdr), MSG_WAITALL) <= 0)
+            if (recv(s, &hdr, sizeof(hdr), MSG_WAITALL) <= 0)
                 break;
             NetRespMeta meta;
-            recv(sock_, &meta, sizeof(meta), MSG_WAITALL);
+            recv(s, &meta, sizeof(meta), MSG_WAITALL);
+            // std::cout << "[Client] Recv: Seq=" << meta.seq_id << " Action=" << static_cast<int>(meta.action) << " Status=" << meta.status << " DataSize=" << hdr.data_size << std::endl;
+
             std::string body;
             body.resize(hdr.data_size);
             if (hdr.data_size > 0)
-                recv(sock_, body.data(), hdr.data_size, MSG_WAITALL);
+                recv(s, body.data(), hdr.data_size, MSG_WAITALL);
 
             {
                 std::lock_guard<std::mutex> lk(map_mtx_);
-                if (response_handlers_.count(meta.seq_id)) {
-                    // std::cout << "[Client] Handling response for Seq: " << meta.seq_id << std::endl;
+                // Check mailbox handlers first (for stream push)
+                if (mailbox_handlers_.count(meta.seq_id)) {
+                     mailbox_handlers_[meta.seq_id](body);
+                }
+                else if (response_handlers_.count(meta.seq_id)) {
+                    // std::cout << "[Client] Received response for Seq: " << meta.seq_id << ". Calling handler." << std::endl;
                     response_handlers_[meta.seq_id](body);
                     response_handlers_.erase(meta.seq_id);
-                }
-                else {
-                    std::cerr << "[Client] Warning: No handler for Seq: " << meta.seq_id << std::endl;
+                } else {
+                    std::cerr << "[Client] Warning: Received response for unknown Seq: " << meta.seq_id << std::endl;
                 }
             }
         }
@@ -702,7 +748,13 @@ private:
                 std::string body(chan->local_buf + 12, data_size);
 
                 std::lock_guard<std::mutex> lk(map_mtx_);
-                if (response_handlers_.count(seq_id)) {
+
+                // Check mailbox handlers first (for stream push)
+                if (mailbox_handlers_.count(seq_id)) {
+                     mailbox_handlers_[seq_id](body);
+                }
+                else if (response_handlers_.count(seq_id)) {
+                    std::cout << "⚡ [Client] RDMA Response received for Seq: " << seq_id << std::endl;
                     response_handlers_[seq_id](body);
                     response_handlers_.erase(seq_id);
                 }
@@ -714,21 +766,24 @@ private:
         }
     }
 
-    int                                                         sock_ = -1;
     std::atomic<uint32_t>                                       seq_{1};
     std::atomic<bool>                                           running_{false};
-    std::mutex                                                  sock_mtx_, map_mtx_;
-    std::thread                                                 receiver_thread_;
+    std::mutex                                                  sock_mtx_, map_mtx_, send_mtx_;
+    std::vector<std::thread>                                    receiver_threads_;
     bool                                                        use_hub_;
     std::string                                                 hub_ip_;
     int                                                         hub_port_;
-    std::string                                                 target_ip_;
-    int                                                         target_port_;
     std::map<uint32_t, std::function<void(const std::string&)>> response_handlers_;
+    std::map<uint32_t, StreamHandler>                           mailbox_handlers_; // [New]
 
-    // Track allocated tickets for auto-release on destruction
-    std::set<std::string> allocated_tickets_;
-    std::mutex            ticket_mtx_;
+    // Multi-node Agent connections
+    std::map<std::string, int>                                  agent_socks_; // addr -> fd
+
+    // Track allocated tickets and slots
+    std::set<std::string>                                       allocated_tickets_;
+    std::map<std::string, std::vector<AllocatedSlot>>           ticket_to_slots_;
+    std::map<std::string, std::string>                          actor_to_addr_;
+    std::mutex                                                  ticket_mtx_;
 
 };  // class Client
 

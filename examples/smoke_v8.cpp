@@ -66,5 +66,14 @@ int main(int argc, char** argv)
 
     std::cout << "[Smoke v8] ALL TESTS PASSED!" << std::endl;
 
+    // 5. Release resources
+    std::cout << "[Smoke v8] Releasing resources..." << std::endl;
+    bool released = client.gangRelease(alloc_resp.ticket_id).get();
+    if (released) {
+        std::cout << "[Smoke v8] Resources released successfully." << std::endl;
+    } else {
+        std::cerr << "[Smoke v8] Failed to release resources!" << std::endl;
+    }
+
     return 0;
 }

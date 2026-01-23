@@ -22,7 +22,9 @@ set(BUILD_RDMA ON CACHE BOOL "Enable RDMA" FORCE)
 set(BUILD_PYTHON OFF CACHE BOOL "Disable Python bindings" FORCE)
 set(BUILD_TEST OFF CACHE BOOL "Disable Tests" FORCE)
 set(BUILD_BENCH OFF CACHE BOOL "Disable Benchmarks" FORCE)
-# Use object library mode or static to avoid rpath hell? No, shared is fine if handled right.
+# Disable CUDA for DLSlime - use HostOnlySignal for RDMA synchronization
+# This allows RDMA to work on CPU-only processes (e.g., EngineActor)
+set(USE_CUDA OFF CACHE BOOL "DLSlime: Disable CUDA" FORCE)
 if(NOT TARGET dlslime)
     add_subdirectory(third_party/DLSlime)
 endif()

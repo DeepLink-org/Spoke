@@ -14,6 +14,27 @@
 
 spoke::Hub g_hub;
 
+#include <ifaddrs.h>
+#include <arpa/inet.h>
+
+std::string get_local_ip() {
+    struct ifaddrs *ifAddrStruct = NULL;
+    struct ifaddrs *ifa = NULL;
+    std::string ip = "127.0.0.1";
+    getifaddrs(&ifAddrStruct);
+    for (ifa = ifAddrStruct; ifa != NULL; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr) continue;
+        if (ifa->ifa_addr->sa_family == AF_INET) { // IPv4
+            char buf[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &((struct sockaddr_in *)ifa->ifa_addr)->sin_addr, buf, INET_ADDRSTRLEN);
+            std::string name = ifa->ifa_name;
+            if (name != "lo") { ip = buf; break; }
+        }
+    }
+    if (ifAddrStruct) freeifaddrs(ifAddrStruct);
+    return ip;
+}
+
 void handle_connection(int fd)
 {
     using namespace spoke;
@@ -150,7 +171,11 @@ int main(int argc, char** argv)
     addr.sin_port        = htons(port);
     (void)bind(sfd, (struct sockaddr*)&addr, sizeof(addr));
     listen(sfd, 5);
-    std::cout << "[Hub] Listening on " << port << "..." << std::endl;
+    std::string hub_ip = get_local_ip();
+    std::cout << "🚀 [Spoke Hub] Ready and listening on port: " << port << std::endl;
+    std::cout << "💡 Tip: To scale your cluster, run the following command on other nodes to register an Agent:" << std::endl;
+    std::cout << "   ./bin/spoke_agent " << hub_ip << " " << port << " --port 4469 --gpus 8" << std::endl;
+
     while (true) {
         int cfd = accept(sfd, nullptr, nullptr);
         if (cfd >= 0)
