@@ -1,3 +1,4 @@
+Features were moved to [DLslime](https://github.com/Deeplink-org/DLSlime), refer to [DLSlimeRPC](https://deeplink-org.github.io/DLSlime/latest/guide/slimerpc/).
 # Spoke: High-Performance Distributed Actor Framework
 
 Spoke is a lightweight, low-latency distributed task execution framework designed for high-performance computing and LLM inference workloads. It serves as a C++ native, RDMA-optimized alternative to heavier frameworks like Ray, specifically tailored for the needs of LLM inference.
